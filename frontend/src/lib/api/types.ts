@@ -482,6 +482,23 @@ export interface ApiKeyUpdate {
   name?: string | null;
 }
 
+/** SDK application credentials for mobile app authentication. */
+export interface Application {
+  id: string;
+  app_id: string;
+  name: string;
+  created_at: string;
+}
+
+export interface ApplicationCreate {
+  name: string;
+}
+
+/** Returned only on create / rotate-secret — secret cannot be retrieved again. */
+export interface ApplicationWithSecret extends Application {
+  app_secret: string;
+}
+
 export interface Automation {
   id: string;
   name: string;
