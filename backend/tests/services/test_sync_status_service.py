@@ -91,6 +91,28 @@ class TestEmitAndPersist:
         assert summary.stage == SyncStage.COMPLETED.value
         assert summary.status == SyncStatus.SUCCESS.value
 
+    def test_partial_run_summary_preserves_counts_and_errors(self, user_id: str) -> None:
+        run_id = sync_status_service.new_run_id("sdk")
+        errors = [{"collection": "records", "index": 1, "loc": "value"}]
+        sync_status_service.completed(
+            user_id,
+            "apple",
+            SyncSource.SDK,
+            run_id=run_id,
+            status=SyncStatus.PARTIAL,
+            error="1 record(s) dropped by validation",
+            metadata={"batch_id": run_id, "dropped_count": 1, "errors": errors},
+        )
+
+        summaries = sync_status_service.get_run_summaries(user_id)
+        assert len(summaries) == 1
+        summary = summaries[0]
+        assert summary.status == SyncStatus.PARTIAL.value
+        assert summary.error == "1 record(s) dropped by validation"
+        assert summary.metadata["batch_id"] == run_id
+        assert summary.metadata["dropped_count"] == 1
+        assert summary.metadata["errors"] == errors
+
 
 class TestTerminalSvixDispatch:
     @pytest.fixture

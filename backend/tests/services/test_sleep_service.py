@@ -240,6 +240,37 @@ class TestCalculateFinalMetrics:
         # Cleaned stages should only include sleeping (not in_bed)
         assert all(s.stage == SleepStageType.SLEEPING for s in cleaned)
 
+    def test_sleeping_intervals_merge_overlaps_but_preserve_gaps(self) -> None:
+        """Generic sleeping intervals are unioned without filling real gaps."""
+        stages = [
+            SleepStateStage(
+                stage=SleepStageType.SLEEPING,
+                start_time=_dt("2026-03-10T22:00:00Z"),
+                end_time=_dt("2026-03-10T23:00:00Z"),
+            ),
+            SleepStateStage(
+                stage=SleepStageType.SLEEPING,
+                start_time=_dt("2026-03-10T22:30:00Z"),
+                end_time=_dt("2026-03-10T23:30:00Z"),
+            ),
+            SleepStateStage(
+                stage=SleepStageType.SLEEPING,
+                start_time=_dt("2026-03-11T00:00:00Z"),
+                end_time=_dt("2026-03-11T00:30:00Z"),
+            ),
+        ]
+
+        metrics, cleaned = _calculate_final_metrics(stages)
+
+        sleeping = [stage for stage in cleaned if stage.stage == SleepStageType.SLEEPING]
+        assert len(sleeping) == 2
+        assert sleeping[0].start_time == _dt("2026-03-10T22:00:00Z")
+        assert sleeping[0].end_time == _dt("2026-03-10T23:30:00Z")
+        assert sleeping[1].start_time == _dt("2026-03-11T00:00:00Z")
+        assert sleeping[1].end_time == _dt("2026-03-11T00:30:00Z")
+        assert sleeping[0].end_time <= sleeping[1].start_time
+        assert metrics["sleeping_seconds"] == 120 * 60
+
     def test_detailed_stages(self) -> None:
         """Modern Apple Watch data with deep/light/rem/awake breakdown."""
         stages = [
@@ -315,8 +346,8 @@ class TestCalculateFinalMetrics:
         assert len(cleaned) == 1
         assert cleaned[0].stage == SleepStageType.SLEEPING
 
-    def test_detailed_plus_sleeping_wrapper_excludes_sleeping(self) -> None:
-        """When detailed phases + sleeping wrapper coexist, sleeping is dropped."""
+    def test_detailed_plus_sleeping_wrapper_keeps_unobserved_sleeping(self) -> None:
+        """Detailed phases overlay generic sleeping without changing its stage type."""
         stages = [
             SleepStateStage(
                 stage=SleepStageType.SLEEPING,
@@ -342,14 +373,14 @@ class TestCalculateFinalMetrics:
 
         metrics, cleaned = _calculate_final_metrics(stages)
 
-        # sleeping wrapper must NOT be counted
-        assert metrics["sleeping_seconds"] == 0
+        # Generic sleeping fills the unobserved portions of the wrapper.
+        assert metrics["sleeping_seconds"] == (10 + 240) * 60
         assert metrics["light_seconds"] == 50 * 60
         assert metrics["deep_seconds"] == 2 * 3600
         assert metrics["rem_seconds"] == 1 * 3600
-        # Hypnogram should not contain sleeping
+        # The observed phases are unchanged, and generic sleeping is explicit.
         stage_types = {s.stage for s in cleaned}
-        assert SleepStageType.SLEEPING not in stage_types
+        assert SleepStageType.SLEEPING in stage_types
         assert SleepStageType.IN_BED not in stage_types
 
     def test_detailed_plus_sleeping_plus_in_bed(self) -> None:
@@ -379,15 +410,15 @@ class TestCalculateFinalMetrics:
 
         metrics, cleaned = _calculate_final_metrics(stages)
 
-        # Only detailed phases should be counted
-        assert metrics["sleeping_seconds"] == 0
+        # Generic sleeping fills the portions not covered by observed phases.
+        assert metrics["sleeping_seconds"] == (30 + 240) * 60
         assert metrics["deep_seconds"] == 1.5 * 3600
         assert metrics["light_seconds"] == 2 * 3600
         # in_bed still calculated from original intervals
         assert metrics["in_bed_seconds"] == 8 * 3600
-        # Hypnogram: only deep + light
+        # Hypnogram keeps observed stages and the generic portions.
         stage_types = {s.stage for s in cleaned}
-        assert stage_types == {SleepStageType.DEEP, SleepStageType.LIGHT}
+        assert stage_types == {SleepStageType.SLEEPING, SleepStageType.DEEP, SleepStageType.LIGHT}
 
 
 class TestFinishSleep:

@@ -54,8 +54,13 @@ class TimeSeriesService(
         self,
         db_session: DbSession,
         samples: (list[TimeSeriesSampleCreate] | list[HeartRateSampleCreate] | list[StepSampleCreate]),
+        default_is_daily_total: bool | None = None,
     ) -> WriteCounts:
-        counts = self.crud.bulk_create(db_session, samples)  # ty:ignore[invalid-argument-type]
+        counts = self.crud.bulk_create(  # ty:ignore[invalid-argument-type]
+            db_session,
+            samples,
+            default_is_daily_total=default_is_daily_total,
+        )
         samples_copy = list(samples)
 
         @sa_event.listens_for(db_session, "after_commit", once=True)

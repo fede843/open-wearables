@@ -70,6 +70,43 @@ Unlike cloud-based providers (Garmin, Polar, Suunto) that use webhooks and OAuth
   </Card>
 </CardGroup>
 
+## Daily Totals in Metric Records
+
+SDK metric records may include the optional `isDailyTotal` boolean:
+
+```json
+{
+  "type": "HKQuantityTypeIdentifierStepCount",
+  "startDate": "2026-08-07T00:00:00Z",
+  "endDate": "2026-08-07T00:15:00Z",
+  "value": 120,
+  "unit": "count",
+  "isDailyTotal": false
+}
+```
+
+For additive series such as steps, `true` identifies a device-reported daily total and `false` identifies an intraday
+sample. Omitting the field (or sending `null`) defaults new intraday rows to `false`; on a retry, an omitted field does
+not replace an existing `true` daily total with `false`. The field is not applicable to non-additive metrics such as
+heart rate.
+
+## Fork Import Contract
+
+The local fork is based on upstream and extends the SDK importer for workout
+enrichment. The verified behavior is:
+
+- `workout.route` is persisted as canonical `latitude`, `longitude`, and
+  `elevation` time series. Standalone latitude/longitude metric records are not
+  required for route storage.
+- `segments` and `hrZones` are persisted in workout details.
+- Time-series writes use the `(data source, series type, timestamp)` uniqueness
+  constraint as an idempotent upsert. The stored value precision is
+  `NUMERIC(15,6)`.
+- The `202 Accepted` response returns `batch_id`. The terminal run is
+  `partial` when records are dropped; a nonzero drop count is not success.
+- When the source has no reliable detailed sleep transition, the importer uses
+  the generic `sleeping` phase rather than inventing a specific stage.
+
 ## Security Model
 
 The SDK uses a secure token-based authentication flow that keeps your App credentials safe:

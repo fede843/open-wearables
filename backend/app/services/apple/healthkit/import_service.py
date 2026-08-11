@@ -38,6 +38,7 @@ from app.schemas.providers.mobile_sdk.sync_request import (
     SleepRecord,
     SyncRequestData,
     Workout,
+    WorkoutRoutePoint,
 )
 from app.schemas.responses.upload import UploadDataResponse
 from app.services.event_record_service import event_record_service
@@ -161,6 +162,24 @@ class ImportService:
                 original_source_name,
             )
 
+            if wjson.segments:
+                metrics["segments"] = wjson.segments
+            if wjson.hr_zones is not None and (
+                wjson.hr_zones.zones or wjson.hr_zones.max_hr is not None or wjson.hr_zones.threshold_hr is not None
+            ):
+                metrics["hr_zones"] = wjson.hr_zones
+            time_series_samples.extend(
+                self._build_route_samples(
+                    wjson.route,
+                    user_uuid,
+                    device_model,
+                    software_version,
+                    wjson.zoneOffset,
+                    provider,
+                    original_source_name,
+                )
+            )
+
             if duration is None:
                 duration = int((wjson.endDate - wjson.startDate).total_seconds())
 
@@ -190,6 +209,45 @@ class ImportService:
             )
 
             yield record, detail, time_series_samples
+
+    def _build_route_samples(
+        self,
+        route: list[WorkoutRoutePoint] | None,
+        user_uuid: UUID,
+        device_model: str | None,
+        software_version: str | None,
+        zone_offset: str | None,
+        provider: str,
+        source_name: str | None,
+    ) -> list[TimeSeriesSampleCreate]:
+        """Convert SDK workout route points to canonical time-series samples."""
+        samples: list[TimeSeriesSampleCreate] = []
+        for point in route or []:
+            point_values = (
+                (SeriesType.latitude, point.latitude),
+                (SeriesType.longitude, point.longitude),
+                (SeriesType.elevation, point.altitude_m),
+            )
+            for series_type, value in point_values:
+                if value is None:
+                    continue
+                samples.append(
+                    TimeSeriesSampleCreate(
+                        id=uuid4(),
+                        external_id=None,
+                        user_id=user_uuid,
+                        source=source_name,
+                        device_model=device_model,
+                        software_version=software_version,
+                        provider=provider,
+                        recorded_at=point.timestamp,
+                        zone_offset=zone_offset,
+                        value=value,
+                        series_type=series_type,
+                        is_daily_total=daily_total_flag(series_type, is_daily=False),
+                    )
+                )
+        return samples
 
     def _normalize_unit(self, series_type: SeriesType, value: Decimal, provider: str | None = None) -> Decimal:
         match series_type:
@@ -248,7 +306,7 @@ class ImportService:
                 zone_offset=rjson.zoneOffset,
                 value=value,
                 series_type=series_type,
-                is_daily_total=daily_total_flag(series_type, is_daily=False),
+                is_daily_total=rjson.is_daily_total,
             )
 
             match series_type:
@@ -287,7 +345,6 @@ class ImportService:
             return EventRecordMetrics(), [], None
 
         stats_dict: dict[str, Decimal | int] = {}
-        stats_dict["energy_burned"] = Decimal("0")
         time_series_samples: list[TimeSeriesSampleCreate] = []
         duration: float | None = None
 
@@ -326,7 +383,7 @@ class ImportService:
                     | WorkoutStatisticType.CALORIES
                     | WorkoutStatisticType.TOTAL_CALORIES
                 ):
-                    stats_dict["energy_burned"] += value
+                    stats_dict["energy_burned"] = stats_dict.get("energy_burned", Decimal("0")) + value
                 case _:
                     detail_field = get_detail_field_from_workout_statistic_type(stat.type)
                     if detail_field:
@@ -366,16 +423,28 @@ class ImportService:
             # Flatten all time series samples from all workouts into a single list
             time_series_samples = [sample for _, _, samples in workout_bundles for sample in samples]
 
-            # Bulk create records - returns only IDs that were actually inserted
+            # Bulk create records - returns only IDs that were actually inserted.
             inserted_ids = self.event_record_service.bulk_create(db_session, records)
             db_session.flush()
 
-            # Filter details to only those records that were actually inserted (avoid FK violation)
-            details_to_insert = [details_by_id[rid] for rid in inserted_ids if rid in details_by_id]
+            # Resolve conflict rows so retries can enrich existing workouts without
+            # creating another event_record. Keep only one detail payload per row.
+            resolved_ids = self.event_record_service.resolve_record_ids(db_session, records)
+            details_by_record_id: dict[UUID, EventRecordDetailCreate] = {}
+            for detail in details_by_id.values():
+                resolved_id = resolved_ids.get(detail.record_id)
+                if resolved_id is not None:
+                    details_by_record_id[resolved_id] = detail.model_copy(update={"record_id": resolved_id})
+            details_to_insert = list(details_by_record_id.values())
 
             # Bulk create details (requires event_record to exist due to FK)
             if details_to_insert:
-                self.event_record_service.bulk_create_details(db_session, details_to_insert, detail_type="workout")
+                self.event_record_service.bulk_create_details(
+                    db_session,
+                    details_to_insert,
+                    detail_type="workout",
+                    webhook_record_ids=set(inserted_ids),
+                )
             workouts_saved = len(inserted_ids)
 
             # Bulk create time series samples
@@ -386,7 +455,7 @@ class ImportService:
         # Process time series samples (records)
         samples = self._build_statistic_bundles(request, user_id)
         if samples:
-            self.timeseries_service.bulk_create_samples(db_session, samples)
+            self.timeseries_service.bulk_create_samples(db_session, samples, default_is_daily_total=False)
             records_saved += len(samples)
 
         # Commit all workout and timeseries changes in one transaction
@@ -447,6 +516,7 @@ class ImportService:
 
             # Load data and get saved counts
             saved_counts = self.load_data(db_session, data, user_id=user_id, batch_id=batch_id)
+            dropped = saved_counts.get("dropped") or []
 
             connection = self.user_connection_repo.get_by_user_and_provider(db_session, UUID(user_id), provider)
             if connection:
@@ -467,10 +537,10 @@ class ImportService:
                 records_saved=saved_counts["records_saved"],
                 workouts_saved=saved_counts["workouts_saved"],
                 sleep_saved=saved_counts["sleep_saved"],
+                dropped_count=len(dropped),
                 validation_ms=saved_counts["validation_ms"],
             )
 
-            dropped = saved_counts.get("dropped") or []
             if dropped:
                 # Partial success: some records failed per-record validation. The good
                 # ones are already saved above; report the exact field errors to Sentry
@@ -513,6 +583,7 @@ class ImportService:
                 response="Import successful",
                 user_id=user_id,
                 dropped_count=len(dropped),
+                errors=dropped,
                 records_saved=saved_counts["records_saved"],
                 workouts_saved=saved_counts["workouts_saved"],
                 sleep_saved=saved_counts["sleep_saved"],

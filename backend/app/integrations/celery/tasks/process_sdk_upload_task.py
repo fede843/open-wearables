@@ -1,5 +1,6 @@
 import uuid
 from logging import getLogger
+from typing import Any
 from uuid import UUID
 
 from celery import shared_task
@@ -34,7 +35,7 @@ def process_sdk_upload(
     user_id: str,
     provider: str,
     batch_id: str | None = None,
-) -> dict[str, int | str]:
+) -> dict[str, Any]:
     """
     Process SDK data import asynchronously.
 
@@ -137,26 +138,34 @@ def process_sdk_upload(
         sleep_saved = int(result.get("sleep_saved", 0) or 0)
         dropped_count = int(result.get("dropped_count", 0) or 0)
         items_total = records_saved + workouts_saved + sleep_saved
+        validation_errors = result.get("errors", [])
+        if not isinstance(validation_errors, list):
+            validation_errors = []
+        terminal_metadata = {
+            "batch_id": batch_id,
+            "records_saved": records_saved,
+            "workouts_saved": workouts_saved,
+            "sleep_saved": sleep_saved,
+            "dropped_count": dropped_count,
+            "error_count": len(validation_errors),
+            "errors": validation_errors[:20],
+        }
 
         if isinstance(status_code, int) and 200 <= status_code < 300:
             message = f"{provider.capitalize()} batch saved"
             if dropped_count:
                 message += f" ({dropped_count} record(s) dropped by validation)"
+            terminal_status = SyncStatus.PARTIAL if dropped_count else SyncStatus.SUCCESS
             completed(
                 user_uuid,
                 provider,
                 SyncSource.SDK,
                 run_id=batch_id,
-                status=SyncStatus.SUCCESS,
+                status=terminal_status,
                 message=message,
+                error=(f"{dropped_count} record(s) dropped by validation" if dropped_count else None),
                 items_processed=items_total,
-                metadata={
-                    "batch_id": batch_id,
-                    "records_saved": records_saved,
-                    "workouts_saved": workouts_saved,
-                    "sleep_saved": sleep_saved,
-                    "dropped_count": dropped_count,
-                },
+                metadata=terminal_metadata,
             )
         else:
             failed(
@@ -166,7 +175,7 @@ def process_sdk_upload(
                 run_id=batch_id,
                 error=str(result.get("response", "Unknown error")),
                 message=f"{provider.capitalize()} batch failed",
-                metadata={"batch_id": batch_id, "status_code": status_code},
+                metadata={**terminal_metadata, "status_code": status_code},
             )
 
         return {**result, "batch_id": batch_id}

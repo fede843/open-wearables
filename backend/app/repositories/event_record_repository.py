@@ -93,6 +93,51 @@ class EventRecordRepository(
             .one_or_none()
         )
 
+    def resolve_record_ids(
+        self,
+        db_session: DbSession,
+        creators: list[EventRecordCreate],
+    ) -> dict[UUID, UUID]:
+        """Resolve creator IDs to persisted IDs after a conflict-safe bulk insert.
+
+        ``bulk_create`` deliberately keeps its insert-only return value for existing
+        callers. SDK imports also need to enrich a record that already exists, so this
+        lookup maps the generated creator ID to the conflict row without creating a
+        second event.
+        """
+        resolved: dict[UUID, UUID] = {}
+        for creator in creators:
+            if creator.data_source_id:
+                data_source_id = creator.data_source_id
+            else:
+                provider = self.data_source_repo.infer_provider_from_source(creator.source)
+                if creator.provider:
+                    with contextlib.suppress(ValueError):
+                        provider = ProviderName(creator.provider)
+                data_source = self.data_source_repo.ensure_data_source(
+                    db_session,
+                    user_id=creator.user_id,
+                    provider=provider,
+                    user_connection_id=creator.user_connection_id,
+                    device_model=creator.device_model,
+                    source=creator.source,
+                    software_version=creator.software_version,
+                )
+                data_source_id = data_source.id
+
+            existing = (
+                db_session.query(self.model)
+                .filter(
+                    self.model.data_source_id == data_source_id,
+                    self.model.start_datetime == creator.start_datetime,
+                    self.model.end_datetime == creator.end_datetime,
+                )
+                .one_or_none()
+            )
+            resolved[creator.id] = existing.id if existing else creator.id
+
+        return resolved
+
     def get_by_external_id(
         self,
         db_session: DbSession,

@@ -10,6 +10,7 @@ from uuid import uuid4
 from sqlalchemy.orm import Session
 
 from app.integrations.celery.tasks.process_sdk_upload_task import process_sdk_upload
+from app.schemas.sync_status import SyncStatus
 from tests.factories import UserFactory
 
 
@@ -97,6 +98,61 @@ class TestProcessSDKUploadTask:
         # Assert
         assert result["status_code"] == 200
         mock_hk_import_service.import_data_from_request.assert_called_once()
+
+    @patch("app.integrations.celery.tasks.process_sdk_upload_task.completed")
+    @patch("app.integrations.celery.tasks.process_sdk_upload_task.started")
+    @patch("app.integrations.celery.tasks.process_sdk_upload_task.sdk_import_service")
+    @patch("app.integrations.celery.tasks.process_sdk_upload_task.SessionLocal")
+    @patch("app.integrations.celery.tasks.process_sdk_upload_task.UserRepository")
+    def test_process_sdk_upload_marks_dropped_items_as_partial(
+        self,
+        mock_user_repo_class: MagicMock,
+        mock_session_local: MagicMock,
+        mock_hk_import_service: MagicMock,
+        mock_started: MagicMock,
+        mock_completed: MagicMock,
+        db: Session,
+    ) -> None:
+        """Dropped records are visible in the terminal run instead of a silent success."""
+        user = UserFactory()
+        mock_session_local.return_value.__enter__ = MagicMock(return_value=db)
+        mock_session_local.return_value.__exit__ = MagicMock(return_value=None)
+
+        mock_user_repo = MagicMock()
+        mock_user_repo.get.return_value = user
+        mock_user_repo_class.return_value = mock_user_repo
+
+        errors = [{"collection": "records", "index": 2, "loc": "value", "msg": "invalid", "type": "value_error"}]
+        mock_response = MagicMock()
+        mock_response.model_dump.return_value = {
+            "status_code": 200,
+            "response": "Import successful",
+            "records_saved": 3,
+            "workouts_saved": 1,
+            "sleep_saved": 0,
+            "dropped_count": 1,
+            "errors": errors,
+        }
+        mock_hk_import_service.import_data_from_request.return_value = mock_response
+
+        batch_id = "sdk-partial-batch"
+        result = process_sdk_upload(
+            content='{"data":{"workouts":[],"records":[]}}',
+            content_type="application/json",
+            user_id=str(user.id),
+            provider="apple",
+            batch_id=batch_id,
+        )
+
+        assert result["batch_id"] == batch_id
+        mock_started.assert_called_once()
+        mock_completed.assert_called_once()
+        mock_completed_kwargs = mock_completed.call_args.kwargs
+        assert mock_completed_kwargs["status"] == SyncStatus.PARTIAL
+        assert mock_completed_kwargs["error"] == "1 record(s) dropped by validation"
+        assert mock_completed_kwargs["metadata"]["dropped_count"] == 1
+        assert mock_completed_kwargs["metadata"]["records_saved"] == 3
+        assert mock_completed_kwargs["metadata"]["errors"] == errors
 
     @patch("app.integrations.celery.tasks.process_sdk_upload_task.SessionLocal")
     @patch("app.integrations.celery.tasks.process_sdk_upload_task.UserRepository")

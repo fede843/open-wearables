@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 
 from app.models import DataPointSeries, DataSource
 from app.repositories.data_point_series_repository import DataPointSeriesRepository
-from app.schemas.enums import SeriesType
+from app.schemas.enums import SeriesType, get_series_type_id
 from app.schemas.model_crud.activities import TimeSeriesQueryParams, TimeSeriesSampleCreate
 from tests.factories import DataSourceFactory, UserFactory
 
@@ -676,6 +676,43 @@ class TestDataPointSeriesRepository:
         second = series_repo.bulk_create(db, [sample(2000)])
         assert (second.inserted, second.updated) == (0, 1)
         assert int(second) == 1
+
+    def test_bulk_create_preserves_daily_total_when_flag_is_missing(
+        self, db: Session, series_repo: DataPointSeriesRepository
+    ) -> None:
+        """A retry without is_daily_total must not downgrade a stored daily total."""
+        user = UserFactory()
+        timestamp = datetime(2099, 1, 2, tzinfo=timezone.utc)
+
+        first = TimeSeriesSampleCreate(
+            id=uuid4(),
+            user_id=user.id,
+            source="garmin",
+            recorded_at=timestamp,
+            value=1000,
+            series_type=SeriesType.steps,
+            is_daily_total=True,
+        )
+        retry_without_flag = first.model_copy(update={"id": uuid4(), "value": 1100, "is_daily_total": None})
+
+        series_repo.bulk_create(db, [first])
+        series_repo.bulk_create(db, [retry_without_flag], default_is_daily_total=False)
+
+        stored = (
+            db.query(DataPointSeries)
+            .filter(
+                DataPointSeries.recorded_at == timestamp,
+                DataPointSeries.series_type_definition_id == get_series_type_id(SeriesType.steps),
+            )
+            .one()
+        )
+        assert stored.value == Decimal("1100")
+        assert stored.is_daily_total is True
+
+        explicit_false = retry_without_flag.model_copy(update={"value": 1200, "is_daily_total": False})
+        series_repo.bulk_create(db, [explicit_false])
+        db.refresh(stored)
+        assert stored.is_daily_total is False
 
     def test_bulk_create_empty_returns_zero_counts(self, db: Session, series_repo: DataPointSeriesRepository) -> None:
         """An empty batch writes nothing and reports zero inserted/updated."""

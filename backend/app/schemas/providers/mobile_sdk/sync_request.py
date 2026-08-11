@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.constants.series_types.sdk import SDKMetricType, SleepPhase, WorkoutStatisticType
 from app.constants.workout_types import SDKWorkoutType
+from app.schemas.model_crud.activities.zones import HRZones
 
 
 class DeviceType(StrEnum):
@@ -70,6 +71,8 @@ class SourceInfo(BaseModel):
 class MetricRecord(BaseModel):
     """Health metric record from HealthKit (heart rate, steps, distance, etc.)."""
 
+    model_config = ConfigDict(populate_by_name=True)
+
     id: str | None = None
     parentId: str | None = None
     type: SDKMetricType | str | None = None
@@ -80,6 +83,11 @@ class MetricRecord(BaseModel):
     value: Decimal
     unit: str | None
     metadata: list[dict[str, Any]] | dict[str, Any] | None = None
+    is_daily_total: bool | None = Field(
+        default=None,
+        alias="isDailyTotal",
+        description="Whether this additive metric is a pre-aggregated daily total.",
+    )
 
 
 class SleepRecord(BaseModel):
@@ -104,8 +112,23 @@ class WorkoutStatistic(BaseModel):
     value: float | int
 
 
+class WorkoutRoutePoint(BaseModel):
+    """GPS point attached to a workout route."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    timestamp: datetime
+    latitude: Decimal
+    longitude: Decimal
+    altitude_m: Decimal | None = Field(default=None, alias="altitudeM")
+    horizontal_accuracy_m: Decimal | None = Field(default=None, alias="horizontalAccuracyM")
+    vertical_accuracy_m: Decimal | None = Field(default=None, alias="verticalAccuracyM")
+
+
 class Workout(BaseModel):
     """Schema for workout/exercise session from HealthKit."""
+
+    model_config = ConfigDict(populate_by_name=True)
 
     id: str | None = None
     parentId: str | None = None
@@ -118,10 +141,12 @@ class Workout(BaseModel):
     notes: str | None = None
     values: list[WorkoutStatistic] | None = None
 
-    # everything below is unused for now
+    # Route is the canonical SDK path for GPS data. Standalone LATITUDE/LONGITUDE
+    # metric records are intentionally not mapped to avoid storing the same points twice.
     segments: list[dict[str, Any]] | None = None
+    hr_zones: HRZones | None = Field(default=None, alias="hrZones")
     laps: list[dict[str, Any]] | None = None
-    route: list[dict[str, Any]] | None = None
+    route: list[WorkoutRoutePoint] | None = None
     samples: list[dict[str, Any]] | None = None
     metadata: list[dict[str, Any]] | dict[str, Any] | None = None
 

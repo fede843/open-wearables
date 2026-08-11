@@ -79,6 +79,7 @@ WORKOUT_STATISTIC_TYPE_TO_DETAIL_FIELD: dict[str, str] = {
     # Running Metrics
     "averageRunningPower": "average_watts",
     "averageRunningSpeed": "average_speed",
+    "meanCadence": "average_cadence",
     # Elevation (Apple)
     "elevationAscended": "total_elevation_gain",
     # elevationDescended: not stored
@@ -110,7 +111,6 @@ WORKOUT_STATISTIC_TYPE_TO_SERIES_TYPE: dict[str, SeriesType] = {
     # Swimming specific
     "swimmingStrokeCount": SeriesType.swimming_stroke_count,
     # Samsung / Health Connect
-    "meanCadence": SeriesType.cadence,
     "maxCadence": SeriesType.cadence,
     "vo2Max": SeriesType.vo2_max,
     # Legacy mappings

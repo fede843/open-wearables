@@ -412,13 +412,16 @@ Key differences and limitations to be aware of when working with each provider:
 
   - 25+ Health Connect record types mapped to unified series: heart rate, resting HR, HRV, SpO2, blood pressure, respiratory rate, body measurements, steps, calories, and distance
   - Full sleep processing with stages (deep, light, REM, awake), duration, time in bed, efficiency score, and stage timestamps
-  - Workout sessions currently carry duration, type, and start/end times only; heart rate, speed, calorie, and elevation gain aggregates are planned
+  - Workout sessions carry duration, type, start/end times, supported aggregates, and optional route/segment/HR-zone details; in-workout samples remain pending
   - HRV is measured as RMSSD; SDNN is not available
   - Body fat percentage arrives already in percent
   - Blood glucose arrives in mmol/L; values are stored as received until unit conversion ships
   - Health Connect basal metabolic rate is a kcal/day rate stored into the kcal `basal_energy` series
   - All Health Connect distance is stored as `distance_walking_running` regardless of activity type
-  - No health scores; GPS routes and in-workout sample streams are accepted by the SDK payload but not yet processed
+  - No health scores; SDK workout routes are persisted as canonical `latitude`/`longitude` series with optional `elevation`, and `segments`/`hrZones` are stored in workout details
+  - Route values use `NUMERIC(15,6)` storage and an idempotent source/type/timestamp upsert, so repeated raw timestamps do not create duplicate series rows
+  - Standalone `LATITUDE`/`LONGITUDE` metric records are intentionally not mapped; `workout.route` is the canonical GPS path and avoids duplicate points
+  - In-workout `samples` remain accepted-but-unprocessed; existing sleep-stage processing is unchanged and sleep sample extensions remain pending
 </Accordion>
 
 <Accordion title="Google Health — Health API (cloud OAuth)">
@@ -507,4 +510,3 @@ curl -X GET "https://api.openwearables.com/api/v1/users/{user_id}/timeseries\
 &end_time=2025-01-07T23:59:59Z" \
   -H "X-Open-Wearables-API-Key: YOUR_API_KEY"
 ```
-

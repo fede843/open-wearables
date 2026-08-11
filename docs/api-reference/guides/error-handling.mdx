@@ -157,6 +157,28 @@ GET /api/v1/oauth/garmin/authorize?user_id={user_id}
 
 `POST /api/v1/sdk/users/{user_id}/sync` returns **202 Accepted** immediately and validates/imports the payload in a background worker. A malformed record does **not** produce a synchronous `400`/`422` — validation failures are surfaced via the batch's sync status (and internal error reporting), not the HTTP response. The endpoint returns `400` only for an unsupported `provider`.
 
+The `202` response includes the identifier used by the worker and sync-status endpoints:
+
+```json
+{
+  "status_code": 202,
+  "response": "Import task queued successfully",
+  "user_id": "<user-id>",
+  "dropped_count": 0,
+  "records_saved": 0,
+  "workouts_saved": 0,
+  "sleep_saved": 0,
+  "errors": [],
+  "batch_id": "<batch-id>"
+}
+```
+
+`batch_id` is the same value returned as `run_id` by `/api/v1/users/{user_id}/sync/runs` and in sync-status events. If the worker drops individual records, the terminal run has status `partial`; its `metadata` contains the saved counts, `dropped_count`, and PII-free validation errors.
+
+An HTTP `202` only confirms that the batch was queued. Clients must follow the
+matching `batch_id` until a terminal run is reported; `partial`, failed, or
+missing terminal status must not be treated as a successful import.
+
 ---
 
 ## Resource Errors

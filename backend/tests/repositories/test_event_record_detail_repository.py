@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 from app.models import DETAIL_MODELS, DetailType, EventRecordDetail, SleepDetails, WorkoutDetails
 from app.repositories.event_record_detail_repository import EventRecordDetailRepository
 from app.schemas.model_crud.activities import EventRecordDetailCreate, EventRecordDetailUpdate
+from app.schemas.model_crud.activities.zones import HRZones
 from tests.factories import EventRecordFactory, SleepDetailsFactory, WorkoutDetailsFactory
 
 
@@ -214,6 +215,43 @@ class TestEventRecordDetailRepository:
         assert getattr(result, "heart_rate_avg") == Decimal("150.0")
         assert getattr(result, "heart_rate_max") == 180  # Unchanged
         assert getattr(result, "steps_count") == 5000  # Unchanged
+
+    def test_bulk_upsert_keeps_existing_json_when_retry_has_empty_fields(
+        self, db: Session, detail_repo: EventRecordDetailRepository
+    ) -> None:
+        """Empty or omitted SDK JSON fields must not erase an existing enrichment."""
+        event_record = EventRecordFactory(category="workout")
+        detail_repo.bulk_create(
+            db,
+            [
+                EventRecordDetailCreate(
+                    record_id=event_record.id,
+                    segments=[{"lap": 1}],
+                    hr_zones=HRZones(zones=[{"zone": 1, "seconds": 120}]),
+                )
+            ],
+            detail_type="workout",
+        )
+        db.commit()
+
+        detail_repo.bulk_create(
+            db,
+            [
+                EventRecordDetailCreate(
+                    record_id=event_record.id,
+                    segments=[],
+                    hr_zones=HRZones(zones=[]),
+                ),
+                EventRecordDetailCreate(record_id=event_record.id),
+            ],
+            detail_type="workout",
+        )
+        db.commit()
+
+        result = detail_repo.get_by_record_id(db, event_record.id, "workout")
+        assert isinstance(result, WorkoutDetails)
+        assert result.segments == [{"lap": 1}]
+        assert result.hr_zones == {"zones": [{"zone": 1, "seconds": 120.0}]}
 
     def test_delete_workout_details(self, db: Session, detail_repo: EventRecordDetailRepository) -> None:
         """Test deleting workout details."""

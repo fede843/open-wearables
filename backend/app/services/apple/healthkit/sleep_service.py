@@ -40,6 +40,13 @@ _STAGE_TO_METRIC: dict[str, str] = {
     "rem": "rem_seconds",
 }
 
+_OBSERVED_STAGE_TYPES = {
+    SleepStageType.AWAKE,
+    SleepStageType.LIGHT,
+    SleepStageType.DEEP,
+    SleepStageType.REM,
+}
+
 
 def key(user_id: str) -> str:
     """Generate a key for the sleep state."""
@@ -176,7 +183,7 @@ def _apply_transition(
 
     if end_time > state.end_time:
         state.end_time = end_time
-    elif start_time < state.start_time:
+    if start_time < state.start_time:
         state.start_time = start_time
 
     state.last_start_timestamp = start_time
@@ -322,13 +329,72 @@ def handle_sleep_data(
     finalize_stale_sleeps.delay()
 
 
-def _calculate_final_metrics(stages: list[SleepStateStage]) -> tuple[dict, list[SleepStage]]:
-    """
-    Recalculate metrics from stages, handling overlaps by prioritizing earlier segments.
-    Returns (metrics_dict, cleaned_stages_list).
+def _merge_sleeping_intervals(stages: list[SleepStateStage]) -> list[SleepStateStage]:
+    """Union generic sleeping intervals while keeping real gaps between them."""
+    merged: list[SleepStateStage] = []
+    for stage in sorted(stages, key=lambda item: item.start_time):
+        if stage.start_time >= stage.end_time:
+            continue
 
-    Input stages are now list[SleepStateStage] Pydantic models with normalized stage values.
-    """
+        if merged and stage.start_time <= merged[-1].end_time:
+            if stage.end_time > merged[-1].end_time:
+                merged[-1] = merged[-1].model_copy(update={"end_time": stage.end_time})
+            continue
+
+        merged.append(stage.model_copy(update={"stage": SleepStageType.SLEEPING}))
+
+    return merged
+
+
+def _normalize_observed_stages(stages: list[SleepStateStage]) -> list[SleepStateStage]:
+    """Keep observed stages in a non-overlapping timeline, prioritizing earlier data."""
+    normalized: list[SleepStateStage] = []
+    for stage in sorted(stages, key=lambda item: item.start_time):
+        if stage.start_time >= stage.end_time:
+            continue
+
+        start_time = stage.start_time
+        if normalized and start_time < normalized[-1].end_time:
+            start_time = normalized[-1].end_time
+        if start_time >= stage.end_time:
+            continue
+
+        normalized.append(stage.model_copy(update={"start_time": start_time}))
+
+    return normalized
+
+
+def _subtract_observed_stages(
+    sleeping_stages: list[SleepStateStage],
+    observed_stages: list[SleepStateStage],
+) -> list[SleepStateStage]:
+    """Keep generic sleeping only for time not covered by an observed stage."""
+    result: list[SleepStateStage] = []
+    for sleeping in sleeping_stages:
+        fragments = [(sleeping.start_time, sleeping.end_time)]
+        for observed in observed_stages:
+            next_fragments: list[tuple[datetime, datetime]] = []
+            for start_time, end_time in fragments:
+                if observed.end_time <= start_time or observed.start_time >= end_time:
+                    next_fragments.append((start_time, end_time))
+                    continue
+                if start_time < observed.start_time:
+                    next_fragments.append((start_time, observed.start_time))
+                if observed.end_time < end_time:
+                    next_fragments.append((observed.end_time, end_time))
+            fragments = next_fragments
+
+        result.extend(
+            SleepStateStage(stage=SleepStageType.SLEEPING, start_time=start_time, end_time=end_time)
+            for start_time, end_time in fragments
+            if start_time < end_time
+        )
+
+    return result
+
+
+def _calculate_final_metrics(stages: list[SleepStateStage]) -> tuple[dict, list[SleepStage]]:
+    """Recalculate metrics and build a non-overlapping sleep-stage timeline."""
     metrics = {
         "in_bed_seconds": 0,
         "awake_seconds": 0,
@@ -338,55 +404,41 @@ def _calculate_final_metrics(stages: list[SleepStateStage]) -> tuple[dict, list[
         "rem_seconds": 0,
     }
 
-    # Determine processing strategy based on what stage types are present:
-    # - Only in_bed (no sleeping/light/deep/rem): treat in_bed as sleeping (legacy devices)
-    # - Detailed phases present (light/deep/rem): use only detailed + awake, drop sleeping wrapper
-    # - Only sleeping (no detailed): use sleeping + awake as-is
-    has_detailed = any(s.stage in ("light", "deep", "rem") for s in stages)
-    has_sleep_data = any(s.stage in ("sleeping", "light", "deep", "rem") for s in stages)
+    valid_stages = [
+        stage for stage in stages if stage.start_time < stage.end_time and stage.stage != SleepStageType.UNKNOWN
+    ]
+    in_bed_raw = [stage for stage in valid_stages if stage.stage == SleepStageType.IN_BED]
+    sleeping_raw = [stage for stage in valid_stages if stage.stage == SleepStageType.SLEEPING]
+    observed_raw = [stage for stage in valid_stages if stage.stage in _OBSERVED_STAGE_TYPES]
 
+    # Older payloads may only contain in_bed (and optionally awake). Preserve the
+    # legacy fallback, but never reinterpret an explicit sleeping stage.
+    has_sleep_data = bool(
+        sleeping_raw or any(stage.stage in _OBSERVED_STAGE_TYPES - {SleepStageType.AWAKE} for stage in valid_stages)
+    )
     if not has_sleep_data:
-        processable = [
-            SleepStateStage(stage=SleepStageType.SLEEPING, start_time=s.start_time, end_time=s.end_time)
-            if s.stage == "in_bed"
-            else s
-            for s in stages
-            if s.stage != "unknown"
+        sleeping_raw = [
+            SleepStateStage(stage=SleepStageType.SLEEPING, start_time=stage.start_time, end_time=stage.end_time)
+            for stage in in_bed_raw
         ]
-    elif has_detailed:
-        processable = [s for s in stages if s.stage not in ("in_bed", "sleeping", "unknown")]
-    else:
-        processable = [s for s in stages if s.stage not in ("in_bed", "unknown")]
 
-    sorted_processable = sorted(processable, key=lambda x: x.start_time)
+    observed_stages = _normalize_observed_stages(observed_raw)
+    sleeping_stages = _merge_sleeping_intervals(sleeping_raw)
+    sleeping_stages = _subtract_observed_stages(sleeping_stages, observed_stages)
+    processable = sorted(observed_stages + sleeping_stages, key=lambda item: item.start_time)
 
     cleaned_stages: list[SleepStage] = []
-    last_end = None
-
-    for stage in sorted_processable:
-        start = stage.start_time
-        end = stage.end_time
-
-        if last_end and start < last_end:
-            start = last_end
-
-        if start >= end:
-            continue
-
-        duration = (end - start).total_seconds()
-
-        # Safe to access .stage (Pydantic model)
+    for stage in processable:
+        duration = (stage.end_time - stage.start_time).total_seconds()
         phase_str = str(stage.stage)
-
         metric_key = _STAGE_TO_METRIC.get(phase_str)
         if metric_key:
             metrics[metric_key] += duration
-
-        cleaned_stages.append(SleepStage(stage=SleepStageType(phase_str), start_time=start, end_time=end))
-        last_end = end
+        cleaned_stages.append(
+            SleepStage(stage=SleepStageType(phase_str), start_time=stage.start_time, end_time=stage.end_time)
+        )
 
     # 2. Process IN_BED duration separately (union of intervals)
-    in_bed_raw = [s for s in stages if s.stage == "in_bed"]
     if in_bed_raw:
         sorted_in_bed = sorted(in_bed_raw, key=lambda x: x.start_time)
         current_start = None
@@ -439,12 +491,14 @@ def finish_sleep(db_session: DbSession, user_id: str, state: SleepState) -> None
     # state.stages is a list[SleepStateStage]
     metrics, cleaned_stages = _calculate_final_metrics(state.stages)
 
+    # Keep the original state window even when a wrapper stage is clipped around
+    # observed phases or a session contains gaps.  It represents the full range
+    # of endDate/startDate values received by the importer.
+    start_time = state.start_time
+    end_time = state.end_time
     if cleaned_stages:
-        start_time = cleaned_stages[0].start_time
-        end_time = cleaned_stages[-1].end_time
-    else:
-        end_time = state.end_time
-        start_time = state.start_time
+        start_time = min(start_time, cleaned_stages[0].start_time)
+        end_time = max(end_time, max(stage.end_time for stage in cleaned_stages))
 
     # --- Merge with an adjacent existing session if one exists ---
     source_for_lookup = state.source_name if state.source_name != "unknown" else None
@@ -475,7 +529,7 @@ def finish_sleep(db_session: DbSession, user_id: str, state: SleepState) -> None
         end_time = max(adjacent.end_datetime, end_time)
         if cleaned_stages:
             start_time = min(start_time, cleaned_stages[0].start_time)
-            end_time = max(end_time, cleaned_stages[-1].end_time)
+            end_time = max(end_time, max(stage.end_time for stage in cleaned_stages))
 
         # Remove the old record before creating the merged one (cascade deletes detail).
         event_record_service.delete(db_session, adjacent.id)

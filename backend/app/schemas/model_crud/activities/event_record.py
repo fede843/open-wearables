@@ -7,6 +7,8 @@ from pydantic import BaseModel, Field
 
 from app.utils.dates import ZoneOffset
 
+from .zones import HRZones
+
 
 class EventRecordMetrics(TypedDict, total=False):
     """Optional workout or sleep metrics collected from providers."""
@@ -26,6 +28,8 @@ class EventRecordMetrics(TypedDict, total=False):
     average_watts: Decimal | None
     elev_high: Decimal | None
     elev_low: Decimal | None
+    segments: list[dict] | None
+    hr_zones: HRZones | None
     sleep_total_duration_minutes: int | None
     sleep_time_in_bed_minutes: int | None
     sleep_efficiency_score: Decimal | None

@@ -27,17 +27,33 @@ class EventRecordDetailRepository(
     def __init__(self, model: type[EventRecordDetail]):
         super().__init__(model)
 
+    @staticmethod
+    def _dump_detail(creator: EventRecordDetailCreate) -> dict[str, Any]:
+        """Dump scalar fields normally and JSON fields in JSON-compatible mode."""
+        data = creator.model_dump(exclude_none=True)
+        data.update(
+            creator.model_dump(
+                mode="json",
+                exclude_none=True,
+                include={"sleep_stages", "segments", "hr_zones", "power_zones"},
+            )
+        )
+        if not data.get("segments"):
+            data.pop("segments", None)
+
+        hr_zones = data.get("hr_zones")
+        if isinstance(hr_zones, dict) and not (
+            hr_zones.get("zones") or hr_zones.get("max_hr") is not None or hr_zones.get("threshold_hr") is not None
+        ):
+            data.pop("hr_zones", None)
+        return data
+
     def _build_detail(self, creator: EventRecordDetailCreate, detail_type: DetailType) -> EventRecordDetail:
         """Construct the concrete detail ORM object without touching the session."""
         model = DETAIL_MODELS.get(detail_type)
         if model is None:
             raise ValueError(f"Unknown detail type: {detail_type}")
-        creation_data = creator.model_dump(exclude_none=True)
-        if detail_type == "sleep" and creator.sleep_stages:
-            # sleep_stages contains datetime fields that JSONB cannot serialize directly;
-            # use Pydantic's JSON mode to convert datetimes to ISO strings.
-            creation_data["sleep_stages"] = [s.model_dump(mode="json") for s in creator.sleep_stages]
-        return model(**creation_data)
+        return model(**self._dump_detail(creator))
 
     @handle_exceptions
     @handle_duplicates
@@ -96,26 +112,28 @@ class EventRecordDetailRepository(
         child_table = cast(Table, model.__table__)
         valid_columns = set(child_table.columns.keys())
 
-        child_values = []
+        values_by_fields: dict[frozenset[str], list[dict[str, Any]]] = {}
         for creator in creators:
-            data = creator.model_dump()
-            if detail_type == "sleep" and data.get("sleep_stages"):
-                data["sleep_stages"] = [s.model_dump(mode="json") for s in creator.sleep_stages]  # ty:ignore[not-iterable]
+            data = self._dump_detail(creator)
             filtered_data = {k: v for k, v in data.items() if k in valid_columns}
-            child_values.append(filtered_data)
+            values_by_fields.setdefault(frozenset(filtered_data), []).append(filtered_data)
 
-        if not child_values:
+        if not values_by_fields:
             return
 
-        child_stmt = insert(child_table).values(child_values)
-        # record_id is the conflict key; created_at is an immutable audit column and
-        # must not be reset to now() when an existing row is re-synced.
+        # Group by the fields present in each payload. This lets a partial SDK retry
+        # update only supplied columns instead of setting omitted columns to NULL.
         immutable_on_upsert = {"record_id", "created_at"}
-        update_dict = {
-            col_name: child_stmt.excluded[col_name] for col_name in valid_columns if col_name not in immutable_on_upsert
-        }
-        child_stmt = child_stmt.on_conflict_do_update(index_elements=["record_id"], set_=update_dict)
-        db_session.execute(child_stmt)
+        for fields, child_values in values_by_fields.items():
+            child_stmt = insert(child_table).values(child_values)
+            update_dict = {
+                col_name: child_stmt.excluded[col_name] for col_name in fields if col_name not in immutable_on_upsert
+            }
+            if update_dict:
+                child_stmt = child_stmt.on_conflict_do_update(index_elements=["record_id"], set_=update_dict)
+            else:
+                child_stmt = child_stmt.on_conflict_do_nothing(index_elements=["record_id"])
+            db_session.execute(child_stmt)
         # NOTE: Caller should commit - allows batching multiple operations
 
     def get_by_record_id(

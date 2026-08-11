@@ -98,6 +98,38 @@ class TestRunsEndpoint:
         assert len(body) == 1
         assert body[0]["run_id"] == run_id
         assert body[0]["status"] == SyncStatus.SUCCESS.value
+        assert body[0]["metadata"] == {}
+
+    def test_exposes_partial_status_and_terminal_metadata(
+        self,
+        client: TestClient,
+        api_key_header: dict[str, str],
+    ) -> None:
+        user = UserFactory()
+        run_id = "sdk-partial-run"
+        errors = [{"collection": "records", "index": 3, "loc": "value"}]
+        sync_status_service.completed(
+            user.id,
+            "apple",
+            SyncSource.SDK,
+            run_id=run_id,
+            status=SyncStatus.PARTIAL,
+            error="1 record(s) dropped by validation",
+            metadata={"batch_id": run_id, "dropped_count": 1, "errors": errors},
+        )
+
+        response = client.get(
+            f"/api/v1/users/{user.id}/sync/runs",
+            headers=api_key_header,
+        )
+
+        assert response.status_code == 200
+        summary = response.json()[0]
+        assert summary["run_id"] == run_id
+        assert summary["status"] == SyncStatus.PARTIAL.value
+        assert summary["error"] == "1 record(s) dropped by validation"
+        assert summary["metadata"]["dropped_count"] == 1
+        assert summary["metadata"]["errors"] == errors
 
 
 # Note: The actual streaming endpoint behaviour (replay + heartbeat + pubsub

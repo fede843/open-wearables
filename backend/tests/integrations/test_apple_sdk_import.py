@@ -13,8 +13,8 @@ from uuid import uuid4
 import pytest
 from sqlalchemy.orm import Session
 
-from app.models import EventRecord, WorkoutDetails
-from app.schemas.enums import SeriesType
+from app.models import DataPointSeries, DataSource, EventRecord, SleepDetails, WorkoutDetails
+from app.schemas.enums import SeriesType, get_series_type_id
 from app.schemas.providers.mobile_sdk import SyncRequest as SDKSyncRequest
 from app.services.apple.healthkit.import_service import ImportService
 from tests.factories import UserFactory
@@ -330,6 +330,229 @@ class TestAppleSDKImport:
         workouts = db.query(EventRecord).filter(EventRecord.category == "workout").all()
         assert len(workouts) == 1
 
+    def test_reimport_without_energy_keeps_existing_energy(
+        self,
+        db: Session,
+        import_service: ImportService,
+    ) -> None:
+        """A partial retry must not turn a previously stored energy value into zero."""
+        user = UserFactory()
+        source = {"name": "Test Watch", "deviceModel": "Test Watch 1", "deviceManufacturer": "Test"}
+
+        def payload(values: list[dict[str, Any]] | None, *, include_values: bool = True) -> dict[str, Any]:
+            workout: dict[str, Any] = {
+                "id": "ENERGY-RETRY",
+                "type": "running",
+                "startDate": "2025-01-29T10:00:00Z",
+                "endDate": "2025-01-29T10:30:00Z",
+                "source": source,
+            }
+            if include_values:
+                workout["values"] = values
+            return {**SDK_ENVELOPE, "data": {"workouts": [workout]}}
+
+        initial = import_service.load_data(
+            db,
+            payload([{"type": "activeEnergyBurned", "unit": "kcal", "value": 321.5}]),
+            str(user.id),
+        )
+        empty_retry = import_service.load_data(db, payload([]), str(user.id))
+        metric_retry = import_service.load_data(
+            db,
+            payload([{"type": "distance", "unit": "m", "value": 2500}], include_values=True),
+            str(user.id),
+        )
+        omitted_retry = import_service.load_data(db, payload(None, include_values=False), str(user.id))
+
+        assert initial["workouts_saved"] == 1
+        assert empty_retry["workouts_saved"] == 0
+        assert metric_retry["workouts_saved"] == 0
+        assert omitted_retry["workouts_saved"] == 0
+
+        workout = db.query(EventRecord).filter(EventRecord.category == "workout").one()
+        details = db.query(WorkoutDetails).filter(WorkoutDetails.record_id == workout.id).one()
+        assert details.energy_burned == Decimal("321.5")
+        assert details.distance == Decimal("2500")
+
+    def test_import_mean_cadence_as_workout_detail(
+        self,
+        db: Session,
+        import_service: ImportService,
+    ) -> None:
+        """The aggregate cadence statistic belongs on workout_details, not samples."""
+        user = UserFactory()
+        payload = {
+            **SDK_ENVELOPE,
+            "data": {
+                "workouts": [
+                    {
+                        "id": "CADENCE-DETAIL",
+                        "type": "running",
+                        "startDate": "2025-01-29T11:00:00Z",
+                        "endDate": "2025-01-29T11:30:00Z",
+                        "source": {"name": "Test Watch", "deviceModel": "Test Watch 1"},
+                        "values": [{"type": "meanCadence", "unit": "spm", "value": 165}],
+                    }
+                ]
+            },
+        }
+
+        result = import_service.load_data(db, payload, str(user.id))
+
+        assert result["workouts_saved"] == 1
+        assert result["records_saved"] == 0
+        workout = db.query(EventRecord).filter(EventRecord.category == "workout").one()
+        details = db.query(WorkoutDetails).filter(WorkoutDetails.record_id == workout.id).one()
+        assert details.average_cadence == Decimal("165")
+
+    def test_import_route_and_details_enrich_existing_workout(
+        self,
+        db: Session,
+        import_service: ImportService,
+    ) -> None:
+        """Route/details arriving on a retry enrich one event without duplicate rows."""
+        user = UserFactory()
+        source = {
+            "name": "Test Watch",
+            "deviceModel": "Test Watch 1",
+            "deviceManufacturer": "Test",
+        }
+        initial_payload = {
+            **SDK_ENVELOPE,
+            "data": {
+                "workouts": [
+                    {
+                        "id": "ROUTE-INITIAL",
+                        "type": "running",
+                        "startDate": "2025-01-29T10:00:00Z",
+                        "endDate": "2025-01-29T10:30:00Z",
+                        "source": source,
+                        "values": [
+                            {"type": "distance", "unit": "m", "value": 5000},
+                            {"type": "averageHeartRate", "unit": "bpm", "value": 145},
+                        ],
+                    }
+                ],
+            },
+        }
+        enrichment_payload = {
+            **SDK_ENVELOPE,
+            "data": {
+                "workouts": [
+                    {
+                        "id": "ROUTE-ENRICHMENT",
+                        "type": "running",
+                        "startDate": "2025-01-29T10:00:00Z",
+                        "endDate": "2025-01-29T10:30:00Z",
+                        "source": source,
+                        "segments": [{"lap": 1, "duration_seconds": 30.0}],
+                        "hrZones": {
+                            "zones": [{"zone": 1, "seconds": 120}],
+                            "maxHr": 180,
+                            "thresholdHr": 150,
+                        },
+                        "route": [
+                            {
+                                "timestamp": "2025-01-29T10:01:00Z",
+                                "latitude": 52.229676,
+                                "longitude": 21.012229,
+                                "altitudeM": 142.0,
+                            },
+                            {
+                                "timestamp": "2025-01-29T10:02:00Z",
+                                "latitude": 52.229700,
+                                "longitude": 21.012300,
+                            },
+                        ],
+                    }
+                ],
+            },
+        }
+
+        with (
+            patch("app.services.event_record_service.svix_service.is_enabled", return_value=True),
+            patch("app.services.event_record_service.on_workout_created") as mock_workout_webhook,
+        ):
+            assert import_service.load_data(db, initial_payload, str(user.id))["workouts_saved"] == 1
+            result = import_service.load_data(db, enrichment_payload, str(user.id))
+
+            empty_enrichment_payload = {
+                **SDK_ENVELOPE,
+                "data": {
+                    "workouts": [
+                        {
+                            "id": "ROUTE-EMPTY-ENRICHMENT",
+                            "type": "running",
+                            "startDate": "2025-01-29T10:00:00Z",
+                            "endDate": "2025-01-29T10:30:00Z",
+                            "source": source,
+                            "segments": [],
+                            "hrZones": {"zones": []},
+                        }
+                    ],
+                },
+            }
+            empty_result = import_service.load_data(db, empty_enrichment_payload, str(user.id))
+
+        assert mock_workout_webhook.call_count == 1
+
+        assert result["workouts_saved"] == 0
+        assert empty_result["workouts_saved"] == 0
+        workouts = db.query(EventRecord).filter(EventRecord.category == "workout").all()
+        assert len(workouts) == 1
+
+        details = db.query(WorkoutDetails).filter(WorkoutDetails.record_id == workouts[0].id).one()
+        assert details.distance == Decimal("5000")
+        assert details.heart_rate_avg == Decimal("145")
+        assert details.segments == [{"lap": 1, "duration_seconds": 30.0}]
+        assert details.hr_zones is not None
+        assert details.hr_zones["max_hr"] == 180
+        assert details.hr_zones["threshold_hr"] == 150
+        assert details.hr_zones["zones"][0]["seconds"] == 120
+
+        route_series = (
+            db.query(DataPointSeries)
+            .filter(
+                DataPointSeries.series_type_definition_id.in_(
+                    [
+                        get_series_type_id(SeriesType.latitude),
+                        get_series_type_id(SeriesType.longitude),
+                        get_series_type_id(SeriesType.elevation),
+                    ]
+                )
+            )
+            .all()
+        )
+        assert len(route_series) == 5
+        assert sum(s.series_type_definition_id == get_series_type_id(SeriesType.latitude) for s in route_series) == 2
+        assert sum(s.series_type_definition_id == get_series_type_id(SeriesType.longitude) for s in route_series) == 2
+        assert sum(s.series_type_definition_id == get_series_type_id(SeriesType.elevation) for s in route_series) == 1
+
+        values_by_type = {}
+        for sample in route_series:
+            values_by_type.setdefault(sample.series_type_definition_id, []).append(sample.value)
+        assert sorted(values_by_type[get_series_type_id(SeriesType.latitude)]) == [
+            Decimal("52.229676"),
+            Decimal("52.229700"),
+        ]
+        assert sorted(values_by_type[get_series_type_id(SeriesType.longitude)]) == [
+            Decimal("21.012229"),
+            Decimal("21.012300"),
+        ]
+        assert values_by_type[get_series_type_id(SeriesType.elevation)] == [Decimal("142.000000")]
+
+        # A second retry upserts the same timestamp/type keys instead of duplicating points.
+        import_service.load_data(db, enrichment_payload, str(user.id))
+        route_type_ids = [
+            get_series_type_id(SeriesType.latitude),
+            get_series_type_id(SeriesType.longitude),
+            get_series_type_id(SeriesType.elevation),
+        ]
+        route_count = (
+            db.query(DataPointSeries).filter(DataPointSeries.series_type_definition_id.in_(route_type_ids)).count()
+        )
+        assert route_count == 5
+
     def test_import_records_as_time_series(
         self,
         db: Session,
@@ -342,6 +565,126 @@ class TestAppleSDKImport:
         result = import_service.load_data(db, sample_sdk_payload, str(user.id))
 
         assert result["records_saved"] >= 0
+
+    def test_import_sleeping_stages_and_top_level_heart_rate_is_idempotent(
+        self,
+        db: Session,
+        import_service: ImportService,
+    ) -> None:
+        """Generic sleeping stages survive gaps, session bounds, and reimport/upsert."""
+        user = UserFactory()
+        source = {
+            "name": "Xiaomi Watch S3",
+            "deviceModel": "Xiaomi Watch S3",
+            "deviceManufacturer": "Xiaomi",
+        }
+        payload = {
+            **SDK_ENVELOPE,
+            "data": {
+                "records": [
+                    {
+                        "id": "SLEEP-HR-1",
+                        "type": "HKQuantityTypeIdentifierHeartRate",
+                        "startDate": "2026-07-01T22:10:00Z",
+                        "endDate": "2026-07-01T22:10:00Z",
+                        "value": 55,
+                        "unit": "count/min",
+                        "source": source,
+                    }
+                ],
+                "sleep": [
+                    {
+                        "id": "SLEEP-GENERIC-1",
+                        "stage": "sleeping",
+                        "startDate": "2026-07-01T22:00:00Z",
+                        "endDate": "2026-07-01T23:00:00Z",
+                        "source": source,
+                    },
+                    {
+                        "id": "SLEEP-DEEP-1",
+                        "stage": "deep",
+                        "startDate": "2026-07-01T22:15:00Z",
+                        "endDate": "2026-07-01T22:30:00Z",
+                        "source": source,
+                    },
+                    {
+                        "id": "SLEEP-GENERIC-2",
+                        "stage": "sleeping",
+                        "startDate": "2026-07-01T23:30:00Z",
+                        "endDate": "2026-07-02T07:00:00Z",
+                        "source": source,
+                    },
+                    {
+                        "id": "SLEEP-LIGHT-1",
+                        "stage": "light",
+                        "startDate": "2026-07-01T23:30:00Z",
+                        "endDate": "2026-07-02T00:30:00Z",
+                        "source": source,
+                    },
+                    {
+                        "id": "SLEEP-IN-BED-1",
+                        "stage": "in_bed",
+                        "startDate": "2026-07-01T21:50:00Z",
+                        "endDate": "2026-07-02T07:05:00Z",
+                        "source": source,
+                    },
+                ],
+            },
+        }
+
+        result = import_service.load_data(db, payload, str(user.id))
+
+        assert result["sleep_saved"] == 5
+        assert result["records_saved"] == 1
+
+        sleep_records = db.query(EventRecord).filter(EventRecord.category == "sleep").all()
+        assert len(sleep_records) == 1
+        record = sleep_records[0]
+        assert record.end_datetime.isoformat() == "2026-07-02T07:05:00+00:00"
+
+        detail = db.query(SleepDetails).filter(SleepDetails.record_id == record.id).one()
+        assert detail.sleep_deep_minutes == 15
+        assert detail.sleep_light_minutes == 60
+        assert detail.sleep_rem_minutes == 0
+        assert detail.sleep_awake_minutes == 0
+        assert detail.sleep_total_duration_minutes == 510
+        assert detail.sleep_stages is not None
+        assert {stage["stage"] for stage in detail.sleep_stages} == {"sleeping", "deep", "light"}
+
+        sleeping = [stage for stage in detail.sleep_stages if stage["stage"] == "sleeping"]
+        assert len(sleeping) == 3
+        assert all(left["end_time"] <= right["start_time"] for left, right in zip(sleeping, sleeping[1:]))
+
+        heart_rate = (
+            db.query(DataPointSeries)
+            .join(DataSource, DataPointSeries.data_source_id == DataSource.id)
+            .filter(
+                DataSource.user_id == user.id,
+                DataPointSeries.series_type_definition_id == get_series_type_id(SeriesType.heart_rate),
+            )
+            .all()
+        )
+        assert len(heart_rate) == 1
+        assert heart_rate[0].value == Decimal("55")
+
+        # A retry merges/upserts the same session and top-level HR sample instead
+        # of duplicating records, stages, or time-series points.
+        import_service.load_data(db, payload, str(user.id))
+
+        assert db.query(EventRecord).filter(EventRecord.category == "sleep").count() == 1
+        assert db.query(SleepDetails).count() == 1
+        assert (
+            db.query(DataPointSeries)
+            .filter(DataPointSeries.series_type_definition_id == get_series_type_id(SeriesType.heart_rate))
+            .count()
+            == 1
+        )
+
+        reimported_record = db.query(EventRecord).filter(EventRecord.category == "sleep").one()
+        reimported_detail = db.query(SleepDetails).filter(SleepDetails.record_id == reimported_record.id).one()
+        assert reimported_record.end_datetime.isoformat() == "2026-07-02T07:05:00+00:00"
+        assert reimported_detail.sleep_total_duration_minutes == 510
+        assert len(reimported_detail.sleep_stages or []) == 5
 
     def test_import_empty_payload(
         self,

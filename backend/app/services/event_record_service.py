@@ -580,16 +580,25 @@ class EventRecordService(
         # bulk_create_details() when the matching details are inserted.
         return self.crud.bulk_create(db_session, records)
 
+    def resolve_record_ids(
+        self,
+        db_session: DbSession,
+        records: list[EventRecordCreate],
+    ) -> dict[UUID, UUID]:
+        """Resolve generated creator IDs to existing rows after a conflict-safe bulk insert."""
+        return self.crud.resolve_record_ids(db_session, records)
+
     def bulk_create_details(
         self,
         db_session: DbSession,
         details: list[EventRecordDetailCreate],
         detail_type: str = "workout",
+        webhook_record_ids: set[UUID] | None = None,
     ) -> None:
-        """Bulk create event record details and fire one webhook per detail on commit."""
+        """Bulk create details and fire webhooks only for selected new event records."""
         self.event_record_detail_repo.bulk_create(db_session, details, detail_type=detail_type)  # ty:ignore[invalid-argument-type]
 
-        if not details or not svix_service.is_enabled():
+        if not details or (webhook_record_ids is not None and not webhook_record_ids) or not svix_service.is_enabled():
             return
 
         record_ids = [d.record_id for d in details if d.record_id is not None]
@@ -609,6 +618,8 @@ class EventRecordService(
         for detail in details:
             record = records_by_id.get(detail.record_id)
             if record is None or record.data_source_id is None:
+                continue
+            if webhook_record_ids is not None and record.id not in webhook_record_ids:
                 continue
             data_source = data_sources_by_id.get(record.data_source_id)
             if data_source is None:

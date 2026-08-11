@@ -2,6 +2,7 @@
 
 from collections.abc import Generator
 from unittest.mock import MagicMock, patch
+from uuid import UUID
 
 import pytest
 from sqlalchemy.orm import Session
@@ -47,6 +48,41 @@ class TestSDKSyncWithSDKToken:
         # Should not be 401 (auth should pass)
         # May be 400/422 if data format is wrong, but auth should pass
         assert response.status_code != 401
+
+    def test_sync_response_contains_batch_id_and_openapi_contract(
+        self,
+        client: TestClient,
+        mock_celery_tasks: MagicMock,
+        api_v1_prefix: str,
+    ) -> None:
+        """The accepted response identifies the same run queued for the worker."""
+        user_id = "123e4567-e89b-12d3-a456-426614174000"
+        token = create_sdk_user_token("app_123", user_id)
+
+        response = client.post(
+            f"{api_v1_prefix}/sdk/users/{user_id}/sync",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "provider": "apple",
+                "sdkVersion": "1.0.0",
+                "syncTimestamp": "2021-01-01T00:00:00Z",
+                "data": {"workouts": [], "records": []},
+            },
+        )
+
+        assert response.status_code == 202
+        body = response.json()
+        UUID(body["batch_id"])
+        assert body["user_id"] == user_id
+        mock_celery_tasks.delay.assert_called_once()
+        assert mock_celery_tasks.delay.call_args.kwargs["batch_id"] == body["batch_id"]
+
+        openapi = client.get("/openapi.json").json()
+        response_schema = openapi["paths"][f"{api_v1_prefix}/sdk/users/{{user_id}}/sync"]["post"]["responses"]["202"][
+            "content"
+        ]["application/json"]["schema"]
+        schema_name = response_schema["$ref"].rsplit("/", 1)[-1]
+        assert "batch_id" in openapi["components"]["schemas"][schema_name]["required"]
 
     def test_apple_health_sdk_still_accepts_api_key(self, client: TestClient, db: Session, api_v1_prefix: str) -> None:
         """API key should still work for apple-health-sdk (backwards compatibility)."""

@@ -12,7 +12,9 @@ from .system_info import (
     SystemInfoResponse,
 )
 from .upload_response import (
+    SDKSyncAcceptedResponse,
     UploadDataResponse,
+    UploadValidationError,
 )
 
 __all__ = [
@@ -22,6 +24,8 @@ __all__ = [
     "ProviderSyncResult",
     # Upload response
     "UploadDataResponse",
+    "SDKSyncAcceptedResponse",
+    "UploadValidationError",
     # System info
     "ConnectionsCoverage",
     "DataPointsInfo",

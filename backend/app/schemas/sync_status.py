@@ -86,14 +86,18 @@ class SyncRunSummary(BaseModel):
     run_id: str
     user_id: UUID
     provider: str
-    source: str
-    stage: str
-    status: str
+    source: SyncSource
+    stage: SyncStage
+    status: SyncStatus
     message: str | None = None
     progress: float | None = None
     items_processed: int | None = None
     items_total: int | None = None
     error: str | None = None
+    metadata: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Run-level counts and structured errors from the terminal event",
+    )
     primary_user_id: UUID | None = None
     started_at: datetime | None = None
     ended_at: datetime | None = None

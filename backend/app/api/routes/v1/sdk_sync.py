@@ -6,7 +6,7 @@ from fastapi import APIRouter, HTTPException, status
 
 from app.integrations.celery.tasks.process_sdk_upload_task import process_sdk_upload
 from app.schemas.providers.mobile_sdk import SyncRequest
-from app.schemas.responses.upload import UploadDataResponse
+from app.schemas.responses.upload import SDKSyncAcceptedResponse
 from app.services.raw_payload_storage import store_raw_payload
 from app.utils.api_utils import inline_schema_defs
 from app.utils.auth import SDKAuthDep
@@ -31,7 +31,7 @@ def sync_sdk_data(
     user_id: str,
     body: dict,
     auth: SDKAuthDep,
-) -> UploadDataResponse:
+) -> SDKSyncAcceptedResponse:
     """Import health data from SDK provider asynchronously via Celery.
 
     Supports Apple HealthKit and Samsung Health SDK formats (identical payloads):
@@ -54,7 +54,7 @@ def sync_sdk_data(
         auth: SDK authentication (Bearer token or API key)
 
     Returns:
-        UploadDataResponse with 202 status and task queued message
+        SDKSyncAcceptedResponse with 202 status, queue message, and batch ID
 
     Raises:
         HTTPException: 403 if token doesn't match user_id, 400 if provider unsupported.
@@ -123,4 +123,9 @@ def sync_sdk_data(
         batch_id=batch_id,
     )
 
-    return UploadDataResponse(status_code=202, response="Import task queued successfully", user_id=user_id)
+    return SDKSyncAcceptedResponse(
+        status_code=202,
+        response="Import task queued successfully",
+        user_id=user_id,
+        batch_id=batch_id,
+    )

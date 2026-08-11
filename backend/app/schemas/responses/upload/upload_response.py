@@ -1,6 +1,16 @@
 from pydantic import BaseModel, Field
 
 
+class UploadValidationError(BaseModel):
+    """PII-free location of an item rejected during asynchronous validation."""
+
+    collection: str
+    index: int = Field(ge=0)
+    loc: str = ""
+    msg: str | None = None
+    type: str | None = None
+
+
 class UploadDataResponse(BaseModel):
     """Response schema for data upload/sync operations.
 
@@ -15,3 +25,17 @@ class UploadDataResponse(BaseModel):
     records_saved: int = Field(0, description="Time-series samples saved")
     workouts_saved: int = Field(0, description="Workouts saved")
     sleep_saved: int = Field(0, description="Sleep records saved")
+    errors: list[UploadValidationError] = Field(
+        default_factory=list,
+        description="PII-free validation errors for dropped records",
+    )
+
+
+class SDKSyncAcceptedResponse(UploadDataResponse):
+    """Response returned when an SDK sync batch has been queued."""
+
+    batch_id: str = Field(
+        ...,
+        min_length=1,
+        description="Batch identifier; this is also the run_id exposed by the sync status endpoints",
+    )
