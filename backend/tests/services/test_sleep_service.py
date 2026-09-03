@@ -179,6 +179,90 @@ DETAILED_STAGES_PAYLOAD = {
 class TestCalculateFinalMetrics:
     """Tests for _calculate_final_metrics with different stage combinations."""
 
+    def test_unknown_intervals_remain_in_timeline_and_out_of_sleep_totals(self) -> None:
+        stages = [
+            SleepStateStage(
+                stage=SleepStageType.LIGHT,
+                start_time=_dt("2026-04-10T22:00:00Z"),
+                end_time=_dt("2026-04-10T22:10:00Z"),
+            ),
+            SleepStateStage(
+                stage=SleepStageType.UNKNOWN,
+                start_time=_dt("2026-04-10T22:10:00Z"),
+                end_time=_dt("2026-04-10T22:15:00Z"),
+            ),
+            SleepStateStage(
+                stage=SleepStageType.DEEP,
+                start_time=_dt("2026-04-10T22:15:00Z"),
+                end_time=_dt("2026-04-10T22:25:00Z"),
+            ),
+        ]
+
+        metrics, cleaned = _calculate_final_metrics(stages)
+
+        assert metrics["light_seconds"] == 600
+        assert metrics["deep_seconds"] == 600
+        assert metrics["sleeping_seconds"] == 0
+        assert [stage.stage for stage in cleaned] == [
+            SleepStageType.LIGHT,
+            SleepStageType.UNKNOWN,
+            SleepStageType.DEEP,
+        ]
+
+    @pytest.mark.parametrize(
+        "observed_stage",
+        [
+            SleepStageType.LIGHT,
+            SleepStageType.DEEP,
+            SleepStageType.REM,
+            SleepStageType.AWAKE,
+            SleepStageType.SLEEPING,
+        ],
+    )
+    def test_unknown_is_clipped_to_gaps_around_observed_stages(self, observed_stage: SleepStageType) -> None:
+        stages = [
+            SleepStateStage(
+                stage=SleepStageType.UNKNOWN,
+                start_time=_dt("2026-04-10T22:00:00Z"),
+                end_time=_dt("2026-04-10T22:30:00Z"),
+            ),
+            SleepStateStage(
+                stage=observed_stage,
+                start_time=_dt("2026-04-10T22:10:00Z"),
+                end_time=_dt("2026-04-10T22:20:00Z"),
+            ),
+        ]
+
+        metrics, cleaned = _calculate_final_metrics(stages)
+
+        unknown = [stage for stage in cleaned if stage.stage == SleepStageType.UNKNOWN]
+        assert [(stage.start_time, stage.end_time) for stage in unknown] == [
+            (_dt("2026-04-10T22:00:00Z"), _dt("2026-04-10T22:10:00Z")),
+            (_dt("2026-04-10T22:20:00Z"), _dt("2026-04-10T22:30:00Z")),
+        ]
+        assert all(cleaned[index - 1].end_time <= cleaned[index].start_time for index in range(1, len(cleaned)))
+        assert metrics["sleeping_seconds"] == (600 if observed_stage == SleepStageType.SLEEPING else 0)
+
+    def test_unknown_fully_contained_by_observed_stage_is_removed(self) -> None:
+        stages = [
+            SleepStateStage(
+                stage=SleepStageType.UNKNOWN,
+                start_time=_dt("2026-04-10T22:10:00Z"),
+                end_time=_dt("2026-04-10T22:20:00Z"),
+            ),
+            SleepStateStage(
+                stage=SleepStageType.LIGHT,
+                start_time=_dt("2026-04-10T22:00:00Z"),
+                end_time=_dt("2026-04-10T22:30:00Z"),
+            ),
+        ]
+
+        metrics, cleaned = _calculate_final_metrics(stages)
+
+        assert [stage.stage for stage in cleaned] == [SleepStageType.LIGHT]
+        assert metrics["light_seconds"] == 1800
+        assert metrics["sleeping_seconds"] == 0
+
     def test_sleeping_stages_only(self) -> None:
         """Older Apple Watch data: only 'sleeping' stages should NOT map to deep."""
         stages = [

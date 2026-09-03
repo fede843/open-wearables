@@ -16,10 +16,19 @@ from uuid import UUID, uuid4
 from sqlalchemy.orm import Session
 
 from app.models import DataSource, EventRecord
-from app.schemas.model_crud.activities import EventRecordCreate, EventRecordDetailCreate, EventRecordQueryParams
+from app.schemas.model_crud.activities import (
+    EventRecordCreate,
+    EventRecordDetailCreate,
+    EventRecordQueryParams,
+)
 from app.schemas.model_crud.activities.sleep import SleepStage
 from app.services.event_record_service import event_record_service
-from tests.factories import DataSourceFactory, EventRecordFactory, SleepDetailsFactory, UserFactory
+from tests.factories import (
+    DataSourceFactory,
+    EventRecordFactory,
+    SleepDetailsFactory,
+    UserFactory,
+)
 
 
 class TestEventRecordServiceCreateDetail:
@@ -131,7 +140,10 @@ class TestEventRecordServiceBulkCreateDetails:
         ]
 
         with (
-            patch("app.services.event_record_service.svix_service.is_enabled", return_value=True),
+            patch(
+                "app.services.event_record_service.svix_service.is_enabled",
+                return_value=True,
+            ),
             patch("app.services.event_record_service.on_workout_created") as mock_workout,
         ):
             event_record_service.bulk_create_details(db, details, detail_type="workout")
@@ -148,7 +160,10 @@ class TestEventRecordServiceBulkCreateDetails:
         details = [EventRecordDetailCreate(record_id=rec.id, energy_burned=Decimal("250.0"))]
 
         with (
-            patch("app.services.event_record_service.svix_service.is_enabled", return_value=False),
+            patch(
+                "app.services.event_record_service.svix_service.is_enabled",
+                return_value=False,
+            ),
             patch("app.services.event_record_service.on_workout_created") as mock_workout,
         ):
             event_record_service.bulk_create_details(db, details, detail_type="workout")
@@ -158,7 +173,10 @@ class TestEventRecordServiceBulkCreateDetails:
 
     def test_bulk_create_details_empty_list_is_noop(self, db: Session) -> None:
         with (
-            patch("app.services.event_record_service.svix_service.is_enabled", return_value=True),
+            patch(
+                "app.services.event_record_service.svix_service.is_enabled",
+                return_value=True,
+            ),
             patch("app.services.event_record_service.on_workout_created") as mock_workout,
         ):
             event_record_service.bulk_create_details(db, [], detail_type="workout")
@@ -757,6 +775,61 @@ class TestGetSleepSessions:
         session = next(s for s in response.data if s.id == record.id)
         assert session.duration_seconds == 28800
         assert session.sleep_duration_seconds is None
+
+    def test_stage_totals_preserve_null_and_true_zero(self, db: Session) -> None:
+        user = UserFactory()
+        mapping = DataSourceFactory(user=user, source="fixture")
+        null_record = EventRecordFactory(
+            mapping=mapping,
+            category="sleep",
+            type_="sleep",
+            start_datetime=datetime(2026, 4, 12, tzinfo=timezone.utc),
+            duration_seconds=600,
+        )
+        zero_record = EventRecordFactory(
+            mapping=mapping,
+            category="sleep",
+            type_="sleep",
+            start_datetime=datetime(2026, 4, 13, tzinfo=timezone.utc),
+            duration_seconds=600,
+        )
+        SleepDetailsFactory(
+            event_record=null_record,
+            sleep_awake_minutes=None,
+            sleep_light_minutes=None,
+            sleep_deep_minutes=None,
+            sleep_rem_minutes=None,
+        )
+        SleepDetailsFactory(
+            event_record=zero_record,
+            sleep_awake_minutes=0,
+            sleep_light_minutes=0,
+            sleep_deep_minutes=0,
+            sleep_rem_minutes=0,
+        )
+
+        response = event_record_service.get_sleep_sessions(
+            db,
+            user.id,
+            EventRecordQueryParams(
+                start_datetime=datetime(2026, 4, 1, tzinfo=timezone.utc),
+                end_datetime=datetime(2026, 4, 30, tzinfo=timezone.utc),
+            ),
+        )
+        by_id = {session.id: session for session in response.data}
+
+        assert by_id[null_record.id].stages.model_dump() == {
+            "awake_minutes": None,
+            "light_minutes": None,
+            "deep_minutes": None,
+            "rem_minutes": None,
+        }
+        assert by_id[zero_record.id].stages.model_dump() == {
+            "awake_minutes": 0,
+            "light_minutes": 0,
+            "deep_minutes": 0,
+            "rem_minutes": 0,
+        }
 
     def _sleep_record(self, mapping: DataSource) -> EventRecord:
         """Create a sleep session ending 2026-04-11 (UTC) for the given source."""

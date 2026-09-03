@@ -1,4 +1,5 @@
 import contextlib
+import hashlib
 from datetime import datetime, timedelta
 from uuid import UUID
 
@@ -157,6 +158,41 @@ class EventRecordRepository(
         if provider is not None:
             query = query.filter(DataSource.provider == provider)
         return query.one_or_none()
+
+    def lock_exact_sleep_replacement(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        external_id: str,
+        provider: str,
+        source: str,
+        device_model: str | None,
+    ) -> tuple[EventRecord | None, bool]:
+        """Lock one exact identity; report collisions in any other scope."""
+        lock_identity = f"sleep\x1f{external_id}".encode()
+        lock_id = int.from_bytes(hashlib.blake2b(lock_identity, digest_size=8).digest(), signed=True)
+        db_session.execute(select(func.pg_advisory_xact_lock(lock_id)))
+        rows = (
+            db_session.query(self.model)
+            .join(DataSource, self.model.data_source_id == DataSource.id)
+            .filter(self.model.category == "sleep", self.model.external_id == external_id)
+            .with_for_update()
+            .all()
+        )
+        sources = {row.data_source_id: db_session.get(DataSource, row.data_source_id) for row in rows}
+        exact = [
+            row
+            for row in rows
+            if (data_source := sources[row.data_source_id]) is not None
+            and data_source.user_id == user_id
+            and str(data_source.provider) == provider
+            and data_source.source == source
+            and data_source.device_model == device_model
+        ]
+        conflict = bool(rows) and len(exact) != len(rows)
+        if len(exact) > 1:
+            conflict = True
+        return (exact[0] if len(exact) == 1 else None), conflict
 
     def delete_by_external_id(
         self,

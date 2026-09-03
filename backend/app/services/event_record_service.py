@@ -6,6 +6,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import event as sa_event
 from sqlalchemy.orm import Query
 
+from app.constants.sleep import SleepStageType
 from app.database import DbSession
 from app.models import (
     DataPointSeries,
@@ -43,6 +44,7 @@ from app.schemas.responses.activity import (
     Workout,
     WorkoutDetailed,
 )
+from app.schemas.sleep_replacement import ExactSleepReplacement, ExactSleepReplacementResponse
 from app.schemas.utils import (
     PaginatedResponse,
     Pagination,
@@ -52,7 +54,11 @@ from app.schemas.utils import (
     SourceMetadata as DataSourceSchema,
 )
 from app.services.outgoing_webhooks import svix as svix_service
-from app.services.outgoing_webhooks.events import on_menstrual_cycle_created, on_sleep_created, on_workout_created
+from app.services.outgoing_webhooks.events import (
+    on_menstrual_cycle_created,
+    on_sleep_created,
+    on_workout_created,
+)
 from app.services.priority_service import priority_service
 from app.services.scores.sleep_service import sleep_score_service
 from app.services.services import AppService
@@ -100,6 +106,105 @@ class EventRecordService(
 
         return result
 
+    def replace_exact_sleep(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        payload: ExactSleepReplacement,
+    ) -> ExactSleepReplacementResponse | None:
+        """Atomically create or replace one stable, fully specified sleep event."""
+        existing, conflict = self.crud.lock_exact_sleep_replacement(
+            db_session,
+            user_id,
+            payload.external_id,
+            payload.provider,
+            payload.source,
+            payload.device_model,
+        )
+        if conflict:
+            return None
+
+        data_source = self.data_source_repo.get_by_identity(
+            db_session,
+            user_id,
+            ProviderName(payload.provider),
+            payload.device_model,
+            payload.source,
+        )
+        if data_source is None:
+            return None
+
+        created = existing is None
+        duration_seconds = int((payload.end_time - payload.start_time).total_seconds())
+        totals = {stage.value: 0 for stage in SleepStageType}
+        for interval in payload.intervals:
+            totals[interval.stage.value] += int((interval.end_time - interval.start_time).total_seconds())
+        sleep_seconds = sum(totals[stage] for stage in ("sleeping", "light", "deep", "rem"))
+        aggregates = payload.aggregates
+        detail = EventRecordDetailCreate(
+            record_id=existing.id if existing else uuid4(),
+            sleep_total_duration_minutes=(aggregates.sleep_duration_minutes if aggregates else sleep_seconds // 60),
+            sleep_time_in_bed_minutes=(aggregates.time_in_bed_minutes if aggregates else duration_seconds // 60),
+            sleep_deep_minutes=(aggregates.deep_minutes if aggregates else totals["deep"] // 60),
+            sleep_light_minutes=(aggregates.light_minutes if aggregates else totals["light"] // 60),
+            sleep_rem_minutes=(aggregates.rem_minutes if aggregates else totals["rem"] // 60),
+            sleep_awake_minutes=(aggregates.awake_minutes if aggregates else totals["awake"] // 60),
+            is_nap=payload.is_nap,
+            sleep_stages=payload.intervals,
+        )
+        try:
+            if existing is None:
+                record_id = detail.record_id
+                existing = self.crud.create_and_flush(
+                    db_session,
+                    EventRecordCreate(
+                        id=record_id,
+                        external_id=payload.external_id,
+                        data_source_id=data_source.id,
+                        user_id=user_id,
+                        category="sleep",
+                        source_name=payload.source_name,
+                        source=payload.source,
+                        provider=payload.provider,
+                        device_model=payload.device_model,
+                        duration_seconds=duration_seconds,
+                        start_datetime=payload.start_time,
+                        end_datetime=payload.end_time,
+                        zone_offset=payload.zone_offset,
+                    ),
+                )
+                if existing.id != record_id:
+                    db_session.rollback()
+                    return None
+            else:
+                existing.source_name = payload.source_name
+                existing.start_datetime = payload.start_time
+                existing.end_datetime = payload.end_time
+                existing.duration_seconds = duration_seconds
+                existing.zone_offset = payload.zone_offset
+                self.event_record_detail_repo.delete_by_record_id(db_session, existing.id, "sleep")
+            self.event_record_detail_repo.create_and_flush(
+                db_session,
+                detail.model_copy(update={"record_id": existing.id}),
+                detail_type="sleep",
+            )
+            self._recompute_sleep_score_for_record(db_session, user_id, existing)
+            db_session.commit()
+            return ExactSleepReplacementResponse(
+                created=created,
+                external_id=payload.external_id,
+                start_time=payload.start_time,
+                end_time=payload.end_time,
+                duration_seconds=duration_seconds,
+                sleep_duration_seconds=(aggregates.sleep_duration_minutes * 60 if aggregates else sleep_seconds),
+                aggregates=aggregates,
+                sleep_stage_intervals=payload.intervals,
+                is_nap=payload.is_nap,
+            )
+        except Exception:
+            db_session.rollback()
+            raise
+
     def _build_response(
         self,
         record: EventRecord,
@@ -140,14 +245,52 @@ class EventRecordService(
         return result  # ty:ignore[invalid-return-type]
 
     @staticmethod
-    def _local_sleep_date(start_datetime: datetime, zone_offset: str | None) -> date:
-        """Return the local calendar date of a sleep session start (mirrors SQL logic in fill task)."""
-        dt = start_datetime if start_datetime.tzinfo is not None else start_datetime.replace(tzinfo=timezone.utc)
+    def _local_datetime(value: datetime, zone_offset: str | None) -> datetime:
+        dt = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
         if zone_offset is not None:
             sign = 1 if zone_offset[0] == "+" else -1
             hours, minutes = int(zone_offset[1:3]), int(zone_offset[4:6])
             dt = dt.astimezone(timezone(timedelta(hours=sign * hours, minutes=sign * minutes)))
-        return dt.date()
+        return dt
+
+    @classmethod
+    def _local_sleep_date(cls, value: datetime, zone_offset: str | None) -> date:
+        return cls._local_datetime(value, zone_offset).date()
+
+    def _recompute_sleep_score_for_record(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        record: EventRecord,
+    ) -> None:
+        local_end = self._local_datetime(record.end_datetime, record.zone_offset)
+        wake_date = local_end.date()
+        results = sleep_score_service.get_sleep_scores_for_records(
+            db_session,
+            user_id,
+            [(record.id, wake_date)],
+        )
+        result = results.get((record.id, wake_date))
+        if result is None:
+            self.health_score_repo.delete_sleep_record_score(db_session, record.id)
+            return
+        score = HealthScore(
+            id=uuid4(),
+            user_id=user_id,
+            data_source_id=record.data_source_id,
+            provider=ProviderName.INTERNAL,
+            category=HealthScoreCategory.SLEEP,
+            value=result.overall_score,
+            recorded_at=local_end.replace(tzinfo=timezone.utc),
+            components={
+                "duration": ScoreComponent(value=result.breakdown.duration.score).model_dump(),
+                "stages": ScoreComponent(value=result.breakdown.stages.score).model_dump(),
+                "consistency": ScoreComponent(value=result.breakdown.consistency.score).model_dump(),
+                "interruptions": ScoreComponent(value=result.breakdown.interruptions.score).model_dump(),
+            },
+            sleep_record_id=record.id,
+        )
+        self.health_score_repo.upsert_sleep_record_score(db_session, score)
 
     def _recompute_sleep_scores(
         self,
@@ -199,7 +342,13 @@ class EventRecordService(
     ) -> EventRecord | None:
         """Find an existing sleep session adjacent to [start_time, end_time]."""
         return self.crud.find_adjacent_sleep_record(
-            db_session, user_id, start_time, end_time, threshold_minutes, source=source, provider=provider
+            db_session,
+            user_id,
+            start_time,
+            end_time,
+            threshold_minutes,
+            source=source,
+            provider=provider,
         )
 
     def create_or_merge_sleep(
@@ -243,14 +392,16 @@ class EventRecordService(
                 zone_offset=record.zone_offset,
                 duration_seconds=result.duration_seconds,
                 efficiency_percent=float(eff) if eff is not None else None,
-                stages={
-                    "awake_minutes": final_detail.sleep_awake_minutes,
-                    "light_minutes": final_detail.sleep_light_minutes,
-                    "deep_minutes": final_detail.sleep_deep_minutes,
-                    "rem_minutes": final_detail.sleep_rem_minutes,
-                }
-                if has_stages
-                else None,
+                stages=(
+                    {
+                        "awake_minutes": final_detail.sleep_awake_minutes,
+                        "light_minutes": final_detail.sleep_light_minutes,
+                        "deep_minutes": final_detail.sleep_deep_minutes,
+                        "rem_minutes": final_detail.sleep_rem_minutes,
+                    }
+                    if has_stages
+                    else None
+                ),
                 is_nap=final_detail.is_nap,
             )
         return result
@@ -520,14 +671,16 @@ class EventRecordService(
                     zone_offset=zone_offset,
                     duration_seconds=record.duration_seconds,
                     efficiency_percent=float(eff) if eff is not None else None,
-                    stages={
-                        "awake_minutes": detail.sleep_awake_minutes,
-                        "light_minutes": detail.sleep_light_minutes,
-                        "deep_minutes": detail.sleep_deep_minutes,
-                        "rem_minutes": detail.sleep_rem_minutes,
-                    }
-                    if has_stages
-                    else None,
+                    stages=(
+                        {
+                            "awake_minutes": detail.sleep_awake_minutes,
+                            "light_minutes": detail.sleep_light_minutes,
+                            "deep_minutes": detail.sleep_deep_minutes,
+                            "rem_minutes": detail.sleep_rem_minutes,
+                        }
+                        if has_stages
+                        else None
+                    ),
                     is_nap=detail.is_nap,
                 )
             case "menstrual_cycle":
@@ -560,13 +713,13 @@ class EventRecordService(
                     end_time=record.end_datetime.isoformat(),
                     zone_offset=zone_offset,
                     duration_seconds=record.duration_seconds,
-                    calories_kcal=float(detail.energy_burned) if detail.energy_burned is not None else None,
-                    distance_meters=float(detail.distance) if detail.distance is not None else None,
-                    avg_heart_rate_bpm=int(detail.heart_rate_avg) if detail.heart_rate_avg is not None else None,
-                    max_heart_rate_bpm=int(detail.heart_rate_max) if detail.heart_rate_max is not None else None,
-                    elevation_gain_meters=float(detail.total_elevation_gain)
-                    if detail.total_elevation_gain is not None
-                    else None,
+                    calories_kcal=(float(detail.energy_burned) if detail.energy_burned is not None else None),
+                    distance_meters=(float(detail.distance) if detail.distance is not None else None),
+                    avg_heart_rate_bpm=(int(detail.heart_rate_avg) if detail.heart_rate_avg is not None else None),
+                    max_heart_rate_bpm=(int(detail.heart_rate_max) if detail.heart_rate_max is not None else None),
+                    elevation_gain_meters=(
+                        float(detail.total_elevation_gain) if detail.total_elevation_gain is not None else None
+                    ),
                     avg_pace_sec_per_km=avg_pace,
                 )
 
@@ -653,7 +806,10 @@ class EventRecordService(
         self.logger.debug(f"Fetching event records with filters: {query_params.model_dump()}")
 
         records, total_count = self.crud.get_records_with_filters(
-            db_session, query_params, user_id, restrict_to_record_ids=restrict_to_record_ids
+            db_session,
+            query_params,
+            user_id,
+            restrict_to_record_ids=restrict_to_record_ids,
         )
 
         self.logger.debug(f"Retrieved {len(records)} event records out of {total_count} total")
@@ -744,14 +900,14 @@ class EventRecordService(
                 zone_offset=record.zone_offset,
                 duration_seconds=record.duration_seconds,
                 source=self._map_source(data_source),
-                calories_kcal=float(details.energy_burned) if details and details.energy_burned else None,
-                distance_meters=float(details.distance) if details and details.distance else None,
+                calories_kcal=(float(details.energy_burned) if details and details.energy_burned else None),
+                distance_meters=(float(details.distance) if details and details.distance else None),
                 avg_heart_rate_bpm=computed_hr.get(record.id),
                 max_heart_rate_bpm=details.heart_rate_max if details else None,
                 avg_pace_sec_per_km=None,  # Derived or in details?
-                elevation_gain_meters=float(details.total_elevation_gain)
-                if details and details.total_elevation_gain
-                else None,
+                elevation_gain_meters=(
+                    float(details.total_elevation_gain) if details and details.total_elevation_gain else None
+                ),
             )
             data.append(workout)
 
@@ -808,14 +964,14 @@ class EventRecordService(
             zone_offset=record.zone_offset,
             duration_seconds=record.duration_seconds,
             source=self._map_source(data_source),
-            calories_kcal=float(details.energy_burned) if details and details.energy_burned else None,
-            distance_meters=float(details.distance) if details and details.distance else None,
+            calories_kcal=(float(details.energy_burned) if details and details.energy_burned else None),
+            distance_meters=(float(details.distance) if details and details.distance else None),
             avg_heart_rate_bpm=self._resolve_avg_hr(db_session, [record]).get(record.id),
             max_heart_rate_bpm=details.heart_rate_max if details else None,
             avg_pace_sec_per_km=avg_pace_sec_per_km,
-            elevation_gain_meters=float(details.total_elevation_gain)
-            if details and details.total_elevation_gain
-            else None,
+            elevation_gain_meters=(
+                float(details.total_elevation_gain) if details and details.total_elevation_gain else None
+            ),
             heart_rate_samples=[],  # TODO: Fetch from DataPointSeries if needed
         )
 
@@ -840,7 +996,10 @@ class EventRecordService(
             )
 
         records, total_count = self._get_records_with_filters(
-            db_session, params, str(user_id), restrict_to_record_ids=restrict_to_record_ids
+            db_session,
+            params,
+            str(user_id),
+            restrict_to_record_ids=restrict_to_record_ids,
         )
         # Ensure total_count is always an int (not None)
         total_count = total_count if total_count is not None else 0
@@ -896,19 +1055,21 @@ class EventRecordService(
                 source=self._map_source(data_source),
                 duration_seconds=record.duration_seconds or 0,
                 sleep_duration_seconds=sleep_duration_seconds,
-                efficiency_percent=float(details.sleep_efficiency_score)
-                if details and details.sleep_efficiency_score
-                else None,
-                is_nap=details.is_nap if (details and details.is_nap is not None) else False,
+                efficiency_percent=(
+                    float(details.sleep_efficiency_score) if details and details.sleep_efficiency_score else None
+                ),
+                is_nap=(details.is_nap if (details and details.is_nap is not None) else False),
                 sleep_stage_intervals=details.sleep_stages if details else None,
-                stages=SleepStagesSummary(
-                    deep_minutes=details.sleep_deep_minutes or 0 if details else 0,
-                    light_minutes=details.sleep_light_minutes or 0 if details else 0,
-                    rem_minutes=details.sleep_rem_minutes or 0 if details else 0,
-                    awake_minutes=details.sleep_awake_minutes or 0 if details else 0,
-                )
-                if details
-                else None,
+                stages=(
+                    SleepStagesSummary(
+                        deep_minutes=details.sleep_deep_minutes,
+                        light_minutes=details.sleep_light_minutes,
+                        rem_minutes=details.sleep_rem_minutes,
+                        awake_minutes=details.sleep_awake_minutes,
+                    )
+                    if details
+                    else None
+                ),
             )
             data.append(session)
 
@@ -978,16 +1139,16 @@ class EventRecordService(
                     current_phase_type=details.current_phase_type if details else None,
                     day_in_cycle=details.day_in_cycle if details else None,
                     cycle_length=details.cycle_length if details else None,
-                    predicted_cycle_length=details.predicted_cycle_length if details else None,
+                    predicted_cycle_length=(details.predicted_cycle_length if details else None),
                     is_predicted_cycle=details.is_predicted_cycle if details else None,
                     period_length=details.period_length if details else None,
-                    length_of_current_phase=details.length_of_current_phase if details else None,
-                    days_until_next_phase=details.days_until_next_phase if details else None,
-                    fertile_window_start=details.fertile_window_start if details else None,
-                    length_of_fertile_window=details.length_of_fertile_window if details else None,
+                    length_of_current_phase=(details.length_of_current_phase if details else None),
+                    days_until_next_phase=(details.days_until_next_phase if details else None),
+                    fertile_window_start=(details.fertile_window_start if details else None),
+                    length_of_fertile_window=(details.length_of_fertile_window if details else None),
                     last_updated_at=details.last_updated_at if details else None,
-                    has_specified_cycle_length=details.has_specified_cycle_length if details else None,
-                    has_specified_period_length=details.has_specified_period_length if details else None,
+                    has_specified_cycle_length=(details.has_specified_cycle_length if details else None),
+                    has_specified_period_length=(details.has_specified_period_length if details else None),
                     pregnancy_snapshot=details.pregnancy_snapshot if details else None,
                 )
             )

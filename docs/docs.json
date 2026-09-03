@@ -110,6 +110,7 @@
             "group": "Developer Guides",
             "pages": [
               "dev-guides/integration-guide",
+              "dev-guides/exact-sleep-replacement",
               "dev-guides/how-to-add-new-provider",
               "dev-guides/ngrok-setup",
               "dev-guides/seed-data-generator"

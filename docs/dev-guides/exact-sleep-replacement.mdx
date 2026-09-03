@@ -1,0 +1,124 @@
+---
+title: "Exact Sleep Replacement"
+sidebarTitle: "Exact Sleep Replacement"
+description: >-
+  Local fork contract for atomically replacing one stable sleep source-session
+  identity without inventing chronology.
+keywords: ["sleep", "replacement", "idempotency", "development"]
+---
+
+The local fork exposes `PUT /api/v1/users/{user_id}/events/sleep/exact-replacement`
+for a narrowly scoped sleep repair. This capability is `fork_extension`
+development evidence. It is not an upstream/default feature or a production
+`public_api`, and the current checkout is not a reproducible release.
+
+`[PENDING]` Pin an immutable Open Wearables reference and complete compatibility,
+authorization, migration, rollback, and release review before relying on this
+route outside local development.
+
+## Authentication and scope
+
+The route requires the configured API-key dependency and an explicit `user_id`
+path scope. The source must already exist for the tuple of user, provider,
+source, and device model. A missing source or reuse of the external identity in
+another user/source scope returns the same unavailable-scope response, avoiding
+an ownership oracle.
+
+An API key authenticates the request; it does not make a caller-supplied user
+identifier safe. Integrators must authorize and resolve the user server-side and
+must never expose the key or internal user identifier to a browser.
+
+## Stable identity
+
+One replacement is selected by:
+
+```text
+(user_id, provider, source, device_model, external_id)
+```
+
+`external_id` must be stable for the source session. Reusing it in another
+scope is rejected instead of creating or overwriting a second record. Start and
+end timestamps are replaceable values, not the sole identity.
+
+## Request semantics
+
+| Field group                   | Rule                              |
+| ----------------------------- | --------------------------------- |
+| `external_id` and `provider`  | Required non-empty identity.      |
+| `source` and `source_name`    | Required non-empty source fields. |
+| `device_model`                | Optional source model.            |
+| `zone_offset`                 | Optional original offset.         |
+| `start_time` and `end_time`   | Aware, increasing event bounds.   |
+| `is_nap`                      | Strict boolean.                   |
+| `aggregates`                  | Required without intervals.       |
+| `intervals`                   | Optional; complete when supplied. |
+
+Aggregates contain integer, non-negative `sleep_duration_minutes`,
+`time_in_bed_minutes`, `deep_minutes`, `light_minutes`, `rem_minutes`, and
+`awake_minutes` values. Net sleep is exactly `deep + light + rem`; awake is not
+sleep. Sleep plus awake may under-cover time in bed, leaving unclassified
+time-in-bed, but may not exceed it.
+
+Intervals, when supplied, must be timezone-aware and each interval duration must
+be a whole number of minutes. Their timestamps need not fall on absolute clock
+minute boundaries. The intervals must be ordered, contiguous, non-overlapping,
+and cover the exact event bounds. If aggregates are also supplied with
+intervals, `time_in_bed_minutes * 60` must equal the elapsed seconds between the
+event bounds. The interval stage distribution is independent from the aggregate
+distribution; the route does not rewrite either channel to force them to agree.
+
+An aggregate-only request persists no invented interval. If aggregates are
+omitted, the service derives net sleep and stage totals from the complete
+timeline: `sleeping`, `light`, `deep`, and `rem` count as sleep; `awake`,
+`in_bed`, and `unknown` do not. This interval-derived behavior is a fallback,
+not permission to synthesize specific stages from an aggregate.
+
+`[RISK]` The current aggregate-only schema validates aggregate coverage but does
+not independently require `time_in_bed_minutes` to equal the elapsed event
+bounds. A canonical repair client should enforce exact expected bounds before
+calling the route.
+
+`[RISK]` In this local fork, the request schema constrains `provider` only as a
+non-empty string and `zone_offset` only by optional string length. It does not
+fully validate a provider enum/value or the offset format at the request
+boundary. Values accepted there may fail in downstream lookup or offset parsing;
+clients must send a provider and offset supported by the local integration and
+must not treat schema acceptance as end-to-end validation.
+
+## Atomic persistence and readback
+
+The transaction creates or updates the matching event record, replaces its one
+sleep-detail row, recomputes its sleep score, and commits them together. The
+persisted event includes source identity, source name, start/end, duration,
+offset, and nap state. Sleep details include net sleep, time in bed,
+deep/light/REM/awake totals, nap state, and the exact supplied interval list.
+
+The `200` response returns `created`, `external_id`, bounds,
+`duration_seconds`, `sleep_duration_seconds`, aggregates, intervals, and nap
+state; the response interval field is `sleep_stage_intervals`. `GET
+/api/v1/users/{user_id}/events/sleep` provides structural readback of persisted
+bounds, durations, aggregate stages, and intervals. Its normal pagination and
+user scope still apply.
+
+The internal sleep score is linked by sleep-record identity and recomputed for
+the local wake date derived from the event end plus `zone_offset`. Replacing the
+same session updates that linked score rather than creating a second score; a
+missing calculation removes only the score linked to that sleep record.
+
+## Idempotency and concurrency boundary
+
+The repository takes a transaction-scoped PostgreSQL advisory lock derived from
+the sleep external identity, then locks matching rows before replacement. This
+is intended to serialize competing replacements of that identity.
+
+`[VERIFIED]` A prior local disposable-database backend suite completed with
+`2032 passed, 2 skipped`. Focused tests in that suite cover create/replace,
+same-payload sequential retry, one event/detail/score identity, readback,
+aggregate undercoverage, cross-scope nondisclosure, validation failure without
+mutation, and transaction rollback of detail plus score.
+
+`[RISK]` The current focused evidence proves sequential same-state idempotency;
+it does not include a concurrent HTTP replacement test. Treat advisory locking
+as a conservative implementation control, not as completed concurrency proof.
+The disposable Docker database was local and loopback-only, and retained no
+persistent health data after the check.

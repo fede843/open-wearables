@@ -393,6 +393,35 @@ def _subtract_observed_stages(
     return result
 
 
+def _subtract_stage_coverage(
+    stages: list[SleepStateStage],
+    covered_stages: list[SleepStateStage],
+) -> list[SleepStateStage]:
+    """Keep each stage only where no higher-confidence stage has coverage."""
+    result: list[SleepStateStage] = []
+    for stage in stages:
+        fragments = [(stage.start_time, stage.end_time)]
+        for covered in covered_stages:
+            next_fragments: list[tuple[datetime, datetime]] = []
+            for start_time, end_time in fragments:
+                if covered.end_time <= start_time or covered.start_time >= end_time:
+                    next_fragments.append((start_time, end_time))
+                    continue
+                if start_time < covered.start_time:
+                    next_fragments.append((start_time, covered.start_time))
+                if covered.end_time < end_time:
+                    next_fragments.append((covered.end_time, end_time))
+            fragments = next_fragments
+
+        result.extend(
+            stage.model_copy(update={"start_time": start_time, "end_time": end_time})
+            for start_time, end_time in fragments
+            if start_time < end_time
+        )
+
+    return result
+
+
 def _calculate_final_metrics(stages: list[SleepStateStage]) -> tuple[dict, list[SleepStage]]:
     """Recalculate metrics and build a non-overlapping sleep-stage timeline."""
     metrics = {
@@ -404,9 +433,7 @@ def _calculate_final_metrics(stages: list[SleepStateStage]) -> tuple[dict, list[
         "rem_seconds": 0,
     }
 
-    valid_stages = [
-        stage for stage in stages if stage.start_time < stage.end_time and stage.stage != SleepStageType.UNKNOWN
-    ]
+    valid_stages = [stage for stage in stages if stage.start_time < stage.end_time]
     in_bed_raw = [stage for stage in valid_stages if stage.stage == SleepStageType.IN_BED]
     sleeping_raw = [stage for stage in valid_stages if stage.stage == SleepStageType.SLEEPING]
     observed_raw = [stage for stage in valid_stages if stage.stage in _OBSERVED_STAGE_TYPES]
@@ -418,14 +445,28 @@ def _calculate_final_metrics(stages: list[SleepStateStage]) -> tuple[dict, list[
     )
     if not has_sleep_data:
         sleeping_raw = [
-            SleepStateStage(stage=SleepStageType.SLEEPING, start_time=stage.start_time, end_time=stage.end_time)
+            SleepStateStage(
+                stage=SleepStageType.SLEEPING,
+                start_time=stage.start_time,
+                end_time=stage.end_time,
+            )
             for stage in in_bed_raw
         ]
 
     observed_stages = _normalize_observed_stages(observed_raw)
     sleeping_stages = _merge_sleeping_intervals(sleeping_raw)
     sleeping_stages = _subtract_observed_stages(sleeping_stages, observed_stages)
-    processable = sorted(observed_stages + sleeping_stages, key=lambda item: item.start_time)
+    unknown_stages = _normalize_observed_stages(
+        [stage for stage in valid_stages if stage.stage == SleepStageType.UNKNOWN]
+    )
+    unknown_stages = _subtract_stage_coverage(
+        unknown_stages,
+        observed_stages + sleeping_stages,
+    )
+    processable = sorted(
+        observed_stages + sleeping_stages + unknown_stages,
+        key=lambda item: item.start_time,
+    )
 
     cleaned_stages: list[SleepStage] = []
     for stage in processable:
@@ -435,7 +476,11 @@ def _calculate_final_metrics(stages: list[SleepStateStage]) -> tuple[dict, list[
         if metric_key:
             metrics[metric_key] += duration
         cleaned_stages.append(
-            SleepStage(stage=SleepStageType(phase_str), start_time=stage.start_time, end_time=stage.end_time)
+            SleepStage(
+                stage=SleepStageType(phase_str),
+                start_time=stage.start_time,
+                end_time=stage.end_time,
+            )
         )
 
     # 2. Process IN_BED duration separately (union of intervals)

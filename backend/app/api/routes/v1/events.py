@@ -10,12 +10,29 @@ from app.schemas.responses.activity import (
     SleepSession,
     Workout,
 )
+from app.schemas.sleep_replacement import ExactSleepReplacement, ExactSleepReplacementResponse
 from app.schemas.utils import PaginatedResponse
 from app.services import ApiKeyDep
 from app.services.event_record_service import event_record_service
 from app.utils.dates import DateTimeQueryParam, parse_query_datetime
 
 router = APIRouter()
+
+
+@router.put(
+    "/users/{user_id}/events/sleep/exact-replacement",
+)
+def replace_exact_sleep_session(
+    user_id: UUID,
+    payload: ExactSleepReplacement,
+    db: DbSession,
+    _api_key: ApiKeyDep,
+) -> ExactSleepReplacementResponse:
+    """Create or atomically replace one stable sleep source-session identity."""
+    result = event_record_service.replace_exact_sleep(db, user_id, payload)
+    if result is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sleep replacement scope unavailable")
+    return result
 
 
 @router.get("/users/{user_id}/events/workouts")

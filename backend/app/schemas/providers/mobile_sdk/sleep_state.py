@@ -43,4 +43,5 @@ SLEEP_START_STATES = {
     SleepPhase.ASLEEP_LIGHT,
     SleepPhase.ASLEEP_DEEP,
     SleepPhase.ASLEEP_REM,
+    SleepPhase.UNKNOWN,
 }

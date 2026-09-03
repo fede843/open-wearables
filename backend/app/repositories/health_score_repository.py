@@ -14,6 +14,36 @@ from app.utils.pagination import decode_cursor
 
 
 class HealthScoreRepository(CrudRepository[HealthScore, HealthScoreCreate, HealthScoreUpdate]):
+    def upsert_sleep_record_score(self, db_session: DbSession, score: HealthScore) -> HealthScore:
+        existing = (
+            db_session.query(HealthScore).filter(HealthScore.sleep_record_id == score.sleep_record_id).one_or_none()
+        )
+        if existing is None:
+            db_session.add(score)
+            db_session.flush()
+            return score
+        for field in (
+            "user_id",
+            "data_source_id",
+            "provider",
+            "category",
+            "value",
+            "qualifier",
+            "recorded_at",
+            "zone_offset",
+            "components",
+        ):
+            setattr(existing, field, getattr(score, field))
+        db_session.flush()
+        return existing
+
+    def delete_sleep_record_score(self, db_session: DbSession, sleep_record_id: UUID) -> int:
+        return (
+            db_session.query(HealthScore)
+            .filter(HealthScore.sleep_record_id == sleep_record_id)
+            .delete(synchronize_session=False)
+        )
+
     def get_by_all_components(self, db_session: DbSession, components: list[str]) -> list[HealthScore]:
         """Return health scores whose components JSONB contains all specified keys (?& operator)."""
         return db_session.query(HealthScore).filter(HealthScore.components.has_all(components)).all()
